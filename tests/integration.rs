@@ -78,9 +78,11 @@ async fn single_transaction_labelled() {
     .await;
 
     assert_eq!(status, 200, "body: {body}");
-    // Response is EXACTLY {"label": "..."} — nothing else.
+    // Response is EXACTLY {"id", "label"} — nothing else.
     let obj = body.as_object().unwrap();
-    assert_eq!(obj.len(), 1, "response must be label-only: {obj:?}");
+    assert_eq!(obj.len(), 2, "response must be id+label only: {obj:?}");
+    assert_eq!(body["id"], "tx1");
+    assert_eq!(body["id"], "tx1");
     assert_eq!(body["label"], "Lebensmittel");
 }
 
@@ -143,16 +145,21 @@ async fn batch_labels_in_parallel_and_preserves_order() {
 
     let (status, body) = post_json(&url, "/v1/label:batch", json!({"transactions": txs})).await;
     assert_eq!(status, 200, "body: {body}");
-    // Response is EXACTLY {"labels": [...]} — nothing else.
+    // Response is EXACTLY {"results": [{id, label}, ...]} — nothing else.
     let obj = body.as_object().unwrap();
-    assert_eq!(obj.len(), 1, "response must be labels-only: {obj:?}");
-    let labels = body["labels"].as_array().unwrap();
-    assert_eq!(labels.len(), 13);
-    assert_eq!(
-        labels[0], "Lebensmittel",
-        "positional order must be preserved"
-    );
-    assert_eq!(labels[12], "Einkommen");
+    assert_eq!(obj.len(), 1, "response must be results-only: {obj:?}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 13);
+    for (i, r) in results.iter().enumerate() {
+        let expected_id = if i == 12 {
+            "income".to_string()
+        } else {
+            format!("t{i}")
+        };
+        assert_eq!(r["id"], expected_id, "positional order must be preserved");
+    }
+    assert_eq!(results[0]["label"], "Lebensmittel");
+    assert_eq!(results[12]["label"], "Einkommen");
 
     // Parallelism: with 7 chunks, concurrency 4, delay 50ms →
     // sequential would be ≥ 350ms; parallel should be well under.
@@ -178,7 +185,7 @@ async fn concurrency_is_bounded_by_semaphore() {
         .collect();
     let (status, body) = post_json(&url, "/v1/label:batch", json!({"transactions": txs})).await;
     assert_eq!(status, 200, "body: {body}");
-    assert_eq!(body["labels"].as_array().unwrap().len(), 10);
+    assert_eq!(body["results"].as_array().unwrap().len(), 10);
     let max_seen = m.max_in_flight.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         max_seen <= cfg.concurrency,
@@ -209,10 +216,12 @@ async fn empty_labels_fall_back_itemwise() {
         status, 200,
         "batch must degrade item-wise, not fail: {body}"
     );
-    let labels = body["labels"].as_array().unwrap();
-    assert_eq!(labels.len(), 2);
-    assert_eq!(labels[0], "Sonstige Ausgaben");
-    assert_eq!(labels[1], "Sonstige Einnahmen");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["id"], "a");
+    assert_eq!(results[0]["label"], "Sonstige Ausgaben");
+    assert_eq!(results[1]["id"], "b");
+    assert_eq!(results[1]["label"], "Sonstige Einnahmen");
 }
 
 #[tokio::test]
@@ -233,6 +242,7 @@ async fn garbage_output_falls_back_itemwise() {
     .await;
 
     assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["id"], "a");
     assert_eq!(body["label"], "Sonstige Ausgaben");
 }
 
@@ -257,6 +267,7 @@ async fn transient_500_is_retried_then_succeeds() {
         status, 200,
         "retry after transient 500 must succeed: {body}"
     );
+    assert_eq!(body["id"], "a");
     assert_eq!(body["label"], "Lebensmittel");
     assert!(
         m.chat_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
@@ -410,17 +421,22 @@ async fn openapi_docs_are_served() {
         assert!(schemas.contains_key(s), "spec missing schema {s}");
     }
 
-    // Responses must be minimal: {"label"} and {"labels"} only.
+    // Responses must be minimal: {id, label} and {results: [{id, label}]} only.
     let single = schemas["SingleLabelResponse"]["properties"]
         .as_object()
         .unwrap();
-    assert_eq!(single.len(), 1, "single response must be label-only");
-    assert!(single.contains_key("label"));
+    assert_eq!(single.len(), 2, "single response must be id+label only");
+    assert!(single.contains_key("id") && single.contains_key("label"));
     let batch = schemas["BatchLabelResponse"]["properties"]
         .as_object()
         .unwrap();
-    assert_eq!(batch.len(), 1, "batch response must be labels-only");
-    assert!(batch.contains_key("labels"));
+    assert_eq!(batch.len(), 1, "batch response must be results-only");
+    assert!(batch.contains_key("results"));
+    let item = schemas["LabeledTransaction"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_eq!(item.len(), 2, "labeled transaction must be id+label only");
+    assert!(item.contains_key("id") && item.contains_key("label"));
 
     // Swagger UI HTML is served and references the spec.
     let res = client

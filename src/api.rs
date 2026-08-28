@@ -92,7 +92,7 @@ fn api_err(err: ApiError, status: StatusCode, headers: Option<(&str, &str)>) -> 
     path = "/v1/label",
     request_body = LabelSingleRequest,
     responses(
-        (status = 200, description = "The LLM-generated category name for the transaction", body = SingleLabelResponse),
+        (status = 200, description = "The transaction id paired with its LLM-generated category name", body = SingleLabelResponse),
         (status = 400, description = "Invalid input (bad language, over-long field)", body = ApiError),
         (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
         (status = 503, description = "LLM backend unreachable/overloaded; Retry-After: 5", body = ApiError)
@@ -119,8 +119,15 @@ pub async fn label_single(
         .options
         .effective_language(&state.service.default_language);
     match state.service.label(vec![body.transaction], language).await {
-        Ok(batch) => match batch.labels.into_iter().next() {
-            Some(label) => (StatusCode::OK, Json(SingleLabelResponse { label })).into_response(),
+        Ok(batch) => match batch.results.into_iter().next() {
+            Some(r) => (
+                StatusCode::OK,
+                Json(SingleLabelResponse {
+                    id: r.id,
+                    label: r.label,
+                }),
+            )
+                .into_response(),
             None => api_err(
                 ApiError::new("internal", "no label produced"),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -137,7 +144,7 @@ pub async fn label_single(
     path = "/v1/label:batch",
     request_body = LabelBatchRequest,
     responses(
-        (status = 200, description = "One label per input transaction, in input order; items never fail wholesale (generic fallback label instead)", body = BatchLabelResponse),
+        (status = 200, description = "One {id, label} per input transaction, in input order; items never fail wholesale (generic fallback label instead)", body = BatchLabelResponse),
         (status = 400, description = "Empty batch, duplicate ids, bad language, over-long fields", body = ApiError),
         (status = 413, description = "Batch exceeds TL_MAX_BATCH (default 100)", body = ApiError),
         (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
@@ -184,7 +191,7 @@ pub async fn label_batch(
     match state.service.label(body.transactions, language).await {
         Ok(resp) => {
             info!(
-                items = resp.labels.len(),
+                items = resp.results.len(),
                 ms = started.elapsed().as_millis() as u64,
                 "batch labelled"
             );
@@ -291,6 +298,7 @@ pub async fn vram_check_service(
             crate::model::LabelBatchRequest,
             crate::model::SingleLabelResponse,
             crate::model::BatchLabelResponse,
+            crate::model::LabeledTransaction,
             crate::model::ApiError,
             crate::model::ErrorBody,
             crate::model::HealthResponse

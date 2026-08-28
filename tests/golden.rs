@@ -86,7 +86,7 @@ async fn run_through_pipeline(
         .map(|(i, c)| {
             let expectation: GoldenExpectation =
                 serde_json::from_value(c.expected.clone()).unwrap();
-            (c.name.clone(), batch.labels[i].clone(), expectation)
+            (c.name.clone(), batch.results[i].label.clone(), expectation)
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::llm::{LlmError, LlmRequest, OllamaClient, RawLabel};
-use crate::model::{BatchLabelResponse, Transaction};
+use crate::model::{BatchLabelResponse, LabeledTransaction, Transaction};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -73,7 +73,7 @@ impl LabelService {
                 drop(_permit);
                 // Timeout → all-None here, where the chunk is still owned:
                 // validation will send these items through per-item retry →
-                // fallback, keeping the labels[i] ↔ transactions[i] contract.
+                // fallback, keeping the results[i] ↔ transactions[i] contract.
                 let n = chunk.len();
                 match res {
                     Ok(raw) => Ok((chunk, raw)),
@@ -83,7 +83,7 @@ impl LabelService {
             }));
         }
 
-        let mut slots: Vec<Vec<String>> = Vec::with_capacity(chunk_count);
+        let mut slots: Vec<Vec<LabeledTransaction>> = Vec::with_capacity(chunk_count);
         for handle in handles {
             let (chunk, raw) = match handle.await {
                 Ok(Ok(pair)) => pair,
@@ -101,7 +101,7 @@ impl LabelService {
             slots.push(validated);
         }
 
-        let mut results: Vec<String> = Vec::with_capacity(transactions.len());
+        let mut results: Vec<LabeledTransaction> = Vec::with_capacity(transactions.len());
         for chunk_results in slots {
             results.extend(chunk_results);
         }
@@ -112,7 +112,7 @@ impl LabelService {
             "batch labelled"
         );
 
-        Ok(BatchLabelResponse { labels: results })
+        Ok(BatchLabelResponse { results })
     }
 
     /// Validates positional raw labels. Order is preserved: slot `i` of the
@@ -123,14 +123,17 @@ impl LabelService {
         chunk: &[Transaction],
         raw: Vec<Option<RawLabel>>,
         language: &str,
-    ) -> Vec<String> {
-        let mut out: Vec<Option<String>> = vec![None; chunk.len()];
+    ) -> Vec<LabeledTransaction> {
+        let mut out: Vec<Option<LabeledTransaction>> = vec![None; chunk.len()];
         let mut needs_retry: Vec<(usize, Transaction)> = Vec::new();
 
         for (i, tx) in chunk.iter().enumerate() {
             match raw.get(i).and_then(|r| r.as_ref()) {
                 Some(rl) => {
-                    out[i] = Some(rl.label.clone());
+                    out[i] = Some(LabeledTransaction {
+                        id: tx.id.clone(),
+                        label: rl.label.clone(),
+                    });
                 }
                 None => needs_retry.push((i, tx.clone())),
             }
@@ -141,7 +144,10 @@ impl LabelService {
             let outcome = self.classify_single(&tx, language).await;
             match outcome {
                 Some(label) => {
-                    out[i] = Some(label);
+                    out[i] = Some(LabeledTransaction {
+                        id: tx.id.clone(),
+                        label,
+                    });
                 }
                 None => {
                     debug!(id = %tx.id, "falling back after failed labelling");
@@ -150,7 +156,10 @@ impl LabelService {
                     } else {
                         default_income_label(language)
                     };
-                    out[i] = Some(fallback.to_string());
+                    out[i] = Some(LabeledTransaction {
+                        id: tx.id.clone(),
+                        label: fallback.to_string(),
+                    });
                 }
             }
         }

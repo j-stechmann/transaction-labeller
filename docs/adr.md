@@ -203,7 +203,7 @@ micro-batches are the wrong yardstick.
 # ADR-007: Label-only responses (amends ADR-005)
 
 Date: 2026-08-28
-Status: Accepted
+Status: Accepted (amended by ADR-008: id is echoed, the rest stands)
 
 ## Context
 
@@ -230,3 +230,28 @@ be as simple as possible: "I really only need the label."
   rejection still guards against accidental double-submission.
 - OpenAPI schemas shrink to `SingleLabelResponse` / `BatchLabelResponse`,
   each with exactly one property.
+
+# ADR-008: id echo in responses (amends ADR-007)
+
+Date: 2026-08-28
+Status: Accepted (amends ADR-007)
+
+## Context
+
+ADR-007 removed the id echo, making batch association purely positional.
+The product owner reconsidered: ids in requests and responses are worthwhile
+so clients don't tangle label↔transaction association with array mechanics.
+
+## Decision
+
+- `POST /v1/label` → `{"id": "…", "label": "…"}`
+- `POST /v1/label:batch` → `{"results": [{"id", "label"}, …]}` — positional
+  order preserved *and* ids echoed; clients may rely on either.
+- The rest of ADR-007 stands: no model tag, no timing, no rationale.
+- Duplicate ids within a request remain a 400.
+
+## Consequences
+
+- Association is explicit and order-independent for clients; the pipeline
+  still guarantees positional order as a second safety net.
+- Response remains minimal: two fields per transaction.

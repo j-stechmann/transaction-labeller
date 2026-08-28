@@ -69,9 +69,9 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
   (model-echoed indices are never trusted). Empty/missing labels get one
   individual retry (semaphore-bounded), then a generic fallback label
   (`Sonstige Ausgaben`/`Sonstige Einnahmen`, localized for de/en).
-- **Minimal response**: the API returns `{"label": "…"}` /
-  `{"labels": […]}` — nothing else (no id echo, no model tag, no timing;
-  timing is logged, not returned).
+- **Minimal response**: the API returns `{"id", "label"}` /
+  `{"results": [{id, label}, …]}` — nothing else (no model tag, no timing;
+  timing is logged, not returned). The id echo keeps association explicit.
 
 ## API
 
@@ -93,19 +93,22 @@ batch too large, `503` LLM backend unreachable/overloaded (with `Retry-After:
 Response:
 
 ```json
-{"label": "Lebensmittel"}
+{"id": "tx-1", "label": "Lebensmittel"}
 ```
 
 or, for `POST /v1/label:batch`:
 
 ```json
-{"labels": ["Lebensmittel", "Miete", "Einkommen"]}
+{"results": [
+  {"id": "a", "label": "Lebensmittel"},
+  {"id": "b", "label": "Miete"}
+]}
 ```
 
-The label is the only payload the client needs: the LLM-generated category
-name in the requested language. Input `id`s are used solely to reject
-duplicates within a request; batch results are positional (`labels[i]` ↔
-`transactions[i]`).
+The label is the payload the client needs: the LLM-generated category name
+in the requested language. The echoed `id` makes association explicit;
+ids must be unique within a request (duplicates → 400), and batch results
+are additionally positional (`results[i]` ↔ `transactions[i]`).
 
 Direction is *not* returned: it is implied by the amount sign and the model
 sees the signed amount.

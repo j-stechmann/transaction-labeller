@@ -15,7 +15,7 @@ Client ──HTTP──▶ axum REST API ──▶ pipeline (chunk → parallel 
 
 - **Dynamic labels**: the LLM invents the category names (`Lebensmittel`,
   `Groceries`, `Miete`, …) — nothing is pre-determined
-- **Only the label**: response is `{"label": "…"}` (single) / `{"labels": […]}` (batch) — nothing else
+- **Only the label**: response is `{"id", "label"}` (single) / `{"results": [{id, label}, …]}` (batch) — nothing else
 - **REST API**: single + batch endpoints, uniform error envelope, health
 - **Parallel labelling**: transactions are chunked into micro-batches (several
   transactions per prompt), run through a semaphore-bounded pool of
@@ -73,16 +73,20 @@ curl -s localhost:8080/v1/label -H 'content-type: application/json' -d '{
 }'
 ```
 
-Response — the label, nothing else:
+Response — id + label, nothing else:
 
 ```json
-{"label": "Lebensmittel"}
+{"id": "tx-1", "label": "Lebensmittel"}
 ```
 
 For batches:
 
 ```json
-{"labels": ["Lebensmittel", "Miete", "Einkommen"]}
+{"results": [
+  {"id": "a", "label": "Lebensmittel"},
+  {"id": "b", "label": "Miete"},
+  {"id": "c", "label": "Einkommen"}
+]}
 ```
 
 ## API
@@ -95,16 +99,16 @@ Interactive OpenAPI documentation is served by the binary:
 ### `POST /v1/label`
 
 Label a single transaction. Body: `{"transaction": {...}, "options": {...}}`.
-Response: `{"label": "…"}`.
+Response: `{"id": "…", "label": "…"}`.
 
 ### `POST /v1/label:batch`
 
 Label up to `TL_MAX_BATCH` (default 100) transactions in one request.
-Larger volumes: chunk client-side. Response: `{"labels": […]}` — one label
-per transaction, in input order (`labels[i]` ↔ `transactions[i]`). A batch
-never fails wholesale because of one bad item — that item receives a generic
-fallback label (`Sonstige Ausgaben` / `Sonstige Einnahmen`, English
-equivalents for other languages).
+Larger volumes: chunk client-side. Response: `{"results": [{id, label}, …]}` —
+one result per transaction, in input order (`results[i]` ↔
+`transactions[i]`). A batch never fails wholesale because of one bad item —
+that item receives a generic fallback label (`Sonstige Ausgaben` /
+`Sonstige Einnahmen`, English equivalents for other languages).
 
 ### `GET /v1/health`
 
@@ -124,12 +128,13 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 
 ### Response field semantics
 
-- `label` (or `labels[i]`) — the LLM-generated category name in the
-  requested language. Free-form: wording may vary between requests; only the
-  language is guaranteed. Normalize downstream if you need stable grouping.
-- That's the whole response. (The `id` you send is used only to reject
-  duplicates within a request; results are positional, so batch clients
-  associate by index.)
+- `label` — the LLM-generated category name in the requested language.
+  Free-form: wording may vary between requests; only the language is
+  guaranteed. Normalize downstream if you need stable grouping.
+- `id` — echoes the input transaction id, so association never depends on
+  array position. (Ids must still be unique within a request; duplicates are
+  rejected with 400.)
+- That's the whole response.
 
 ## Configuration (environment)
 

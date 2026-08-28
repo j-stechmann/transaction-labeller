@@ -65,20 +65,34 @@ impl LabelOptions {
     }
 }
 
-/// The only thing the client needs: the label.
+/// The label, with the id it belongs to.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SingleLabelResponse {
+    /// Echoes the input transaction id.
+    #[schema(example = "tx-1")]
+    pub id: String,
     /// LLM-generated category name in the requested language.
     #[schema(example = "Lebensmittel")]
     pub label: String,
 }
 
-/// One label per input transaction, in input order (`labels[i]` ↔
-/// request transaction `i`).
+/// One result per input transaction, in input order (`results[i]` ↔
+/// request transaction `i`); `id` makes association explicit.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BatchLabelResponse {
-    #[schema(example = json!(["Lebensmittel", "Miete", "Einkommen"]))]
-    pub labels: Vec<String>,
+    #[schema(example = json!([{"id": "a", "label": "Lebensmittel"}, {"id": "b", "label": "Miete"}]))]
+    pub results: Vec<LabeledTransaction>,
+}
+
+/// A transaction id paired with its LLM-generated label.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LabeledTransaction {
+    /// Echoes the input transaction id.
+    #[schema(example = "tx-1")]
+    pub id: String,
+    /// LLM-generated category name in the requested language.
+    #[schema(example = "Lebensmittel")]
+    pub label: String,
 }
 
 /// Uniform error body: `{ "error": { "code", "message", "details" } }`.
