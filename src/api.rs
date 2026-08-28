@@ -18,15 +18,22 @@ pub struct ApiState {
     pub max_field_len: usize,
 }
 
+/// Shared language-code check: trims, then requires a 2-letter ASCII code.
+/// Returns the normalized (trimmed) code; the caller lowercases when needed.
+fn valid_language_code(raw: &str) -> Result<&str, ApiError> {
+    let l = raw.trim();
+    if l.len() != 2 || !l.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(ApiError::invalid_request(format!(
+            "language must be a 2-letter ISO 639-1 code, got: {raw:?}"
+        )));
+    }
+    Ok(l)
+}
+
 /// Request-level validation shared by single + batch endpoints.
 fn validate_language(opts: &LabelOptions, state: &ApiState) -> Result<(), ApiError> {
     if let Some(lang) = &opts.language {
-        let l = lang.trim();
-        if l.len() != 2 || !l.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(ApiError::invalid_request(format!(
-                "language must be a 2-letter ISO 639-1 code, got: {lang:?}"
-            )));
-        }
+        valid_language_code(lang)?;
         let _ = state; // reserved for future checks
     }
     Ok(())
@@ -251,15 +258,7 @@ pub struct LabelListQuery {
 
 fn query_language(state: &ApiState, query: &LabelListQuery) -> Result<String, ApiError> {
     match &query.language {
-        Some(l) => {
-            let l = l.trim().to_lowercase();
-            if l.len() != 2 || !l.chars().all(|c| c.is_ascii_alphabetic()) {
-                return Err(ApiError::invalid_request(format!(
-                    "language must be a 2-letter ISO 639-1 code, got: {l:?}"
-                )));
-            }
-            Ok(l)
-        }
+        Some(l) => Ok(valid_language_code(l)?.to_lowercase()),
         None => Ok(state.service.default_language.clone()),
     }
 }

@@ -121,6 +121,10 @@ impl LabelService {
         }
 
         let mut slots: Vec<Vec<LabeledTransaction>> = Vec::with_capacity(chunk_count);
+        // Labels learned per chunk, recorded only after *every* chunk
+        // succeeded — otherwise a hard backend failure in a later chunk
+        // (503 + client retry) would double-count the earlier chunks.
+        let mut pending_records: Vec<Vec<String>> = Vec::new();
         for handle in handles {
             let (chunk, raw) = match handle.await {
                 Ok(Ok(pair)) => pair,
@@ -135,13 +139,16 @@ impl LabelService {
                 continue;
             }
             let validated = self.validate_chunk(&chunk, raw, &language).await;
-            // Learn: only labels the model actually produced grow the library.
-            // Fallback labels are excluded so a flaky-backend burst cannot
-            // inflate the generic label into the top-ranked prompt entry.
-            if let Some(lib) = &self.library {
-                lib.record(&language, &validated.model_labels);
-            }
+            pending_records.push(validated.model_labels);
             slots.push(validated.results);
+        }
+        // Learn: only labels the model actually produced grow the library.
+        // Fallback labels are excluded so a flaky-backend burst cannot
+        // inflate the generic label into the top-ranked prompt entry.
+        if let Some(lib) = &self.library {
+            for labels in pending_records {
+                lib.record(&language, &labels);
+            }
         }
 
         let mut results: Vec<LabeledTransaction> = Vec::with_capacity(transactions.len());
@@ -280,6 +287,10 @@ mod tests {
         Config {
             micro_batch: 2,
             concurrency: 2,
+            // Hermetic default: tests opt in to a library file explicitly
+            // (matches test_config in the integration tests; the default
+            // Config would create labels.json in the CWD).
+            label_library: String::new(),
             ..Config::default()
         }
     }
@@ -310,7 +321,6 @@ mod tests {
         cfg.ollama_url = "http://127.0.0.1:1".into(); // nothing listens
         cfg.request_timeout_secs = 1;
         cfg.max_retries = 0;
-        cfg.label_library = String::new(); // hermetic: no file I/O
         let svc = LabelService::new(&cfg);
         let res = svc.label(vec![tx("a", -5.0, "X", "Y")], "de".into()).await;
         assert!(matches!(res, Err(LabelFailure::Backend(_))));

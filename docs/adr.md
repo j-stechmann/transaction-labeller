@@ -282,12 +282,18 @@ A **label library**: a single JSON file (`TL_LABEL_LIBRARY`, default
   wording is allowed only when nothing fits.
 - **Write**: after each successful micro-batch, every label actually
   returned is recorded (count incremented, new labels appended) and the file
-  is persisted atomically (temp file + rename; Windows copy fallback).
+  is persisted atomically (temp file + rename; Windows copy fallback, since
+  `rename` fails there when the destination exists). Recording happens only
+  after the whole request succeeded, so a client retry after a 503 never
+  double-counts labels.
 - **Discovery**: read-only `GET /v1/labels?language=…` (server default
   language when omitted).
 - **Failure posture**: missing/corrupt/unwritable file never fails a
   labelling request — warn and continue (empty in-memory state; a corrupt
-  file is overwritten on the next persist).
+  file is overwritten on the next persist). Individual malformed entries (a
+  bad count, a non-object language) are skipped at load instead of failing
+  the whole parse, so one bad hand-edit cannot discard the rest of the
+  library; the surviving entries are kept and re-persisted.
 - **Opt-out**: `TL_LABEL_LIBRARY=""` restores exact ADR-005 behaviour
   (no injection, no writes).
 - The library is *not* a taxonomy: it has no direction metadata, no slugs,

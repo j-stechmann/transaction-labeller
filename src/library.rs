@@ -27,16 +27,54 @@ struct LibraryState {
     languages: HashMap<String, HashMap<String, u64>>,
 }
 
+/// Parses the library file, tolerating per-entry corruption: a malformed
+/// count or a non-object language entry is skipped (with a warning) instead
+/// of discarding the whole library — one bad hand-edit must not destroy the
+/// previously valid data. Returns `None` only when the file as a whole is
+/// not a JSON object, which is treated as full corruption by the caller.
+fn parse_library_state(text: &str) -> Option<LibraryState> {
+    let top: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text).ok()?;
+    let mut state = LibraryState::default();
+    let mut skipped = 0usize;
+    for (lang, value) in top {
+        let Ok(counts) =
+            serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(value)
+        else {
+            warn!(language = %lang, "label library: skipping non-object language entry");
+            skipped += 1;
+            continue;
+        };
+        for (label, count) in counts {
+            match serde_json::from_value::<u64>(count) {
+                Ok(n) => {
+                    state
+                        .languages
+                        .entry(lang.clone())
+                        .or_default()
+                        .insert(label, n);
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+    if skipped > 0 {
+        warn!(skipped, "label library: skipped malformed entries");
+    }
+    Some(state)
+}
+
 impl LabelLibrary {
     /// Opens (or creates) the library at `path`. A missing file is fine (start
     /// empty); a corrupt file disables the library with a warning rather than
-    /// failing startup — labelling must keep working.
+    /// failing startup — labelling must keep working. Individual malformed
+    /// entries (a bad count, a non-object language) are skipped so a single
+    /// bad hand-edit cannot discard the rest of the library.
     pub fn open(path: PathBuf, max_in_prompt: usize) -> Self {
         let state = match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<LibraryState>(&text) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "label library file corrupt; starting empty");
+            Ok(text) => match parse_library_state(&text) {
+                Some(s) => s,
+                None => {
+                    warn!(path = %path.display(), "label library file corrupt; starting empty");
                     LibraryState::default()
                 }
             },
@@ -117,7 +155,21 @@ impl LabelLibrary {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             std::fs::write(to, text)
         };
-        if let Err(e) = write(&tmp).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+        let result = write(&tmp).and_then(|()| {
+            // Windows: `rename` fails when the destination exists → copy over
+            // (non-atomic on Windows; still crash-safe here because the tmp
+            // write completed first).
+            #[cfg(windows)]
+            {
+                if self.path.exists() {
+                    let copied = std::fs::copy(&tmp, &self.path).map(|_| ());
+                    let _ = std::fs::remove_file(&tmp);
+                    return copied;
+                }
+            }
+            std::fs::rename(&tmp, &self.path)
+        });
+        if let Err(e) = result {
             warn!(path = %self.path.display(), error = %e, "failed to persist label library");
             return;
         }
@@ -212,6 +264,30 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["de"]["Miete"], 1);
+    }
+
+    #[test]
+    fn malformed_entry_is_skipped_rest_survives() {
+        let path = tmp_path("malformed-entry");
+        // Negative count and a non-object language entry are both invalid,
+        // but the valid entries must survive the load.
+        std::fs::write(
+            &path,
+            r#"{"de": {"Miete": 5, "Bad": -1}, "en": "not an object", "fr": {"Pain": 2}}"#,
+        )
+        .unwrap();
+        let lib = LabelLibrary::open(path.clone(), 100);
+        assert_eq!(lib.labels_for("de"), vec!["Miete"]);
+        assert_eq!(lib.labels_for("fr"), vec!["Pain"]);
+        assert!(lib.labels_for("en").is_empty());
+
+        // The next persist keeps the surviving data (does not blank the file).
+        lib.record("fr", &["Pain".into()]);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["de"]["Miete"], 5);
+        assert_eq!(v["fr"]["Pain"], 3);
+        assert!(v.get("en").is_none());
     }
 
     #[test]
