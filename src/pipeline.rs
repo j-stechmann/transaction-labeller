@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::llm::{LlmError, LlmRequest, OllamaClient, RawLabel};
-use crate::model::{ApiError, BatchResponse, LabelResult, Transaction};
+use crate::model::{BatchResponse, LabelResult, Transaction};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -235,16 +235,6 @@ fn default_income_label(language: &str) -> &'static str {
 
 /// Retry-After value for 503 responses.
 pub const RETRY_AFTER_SECS: u64 = 5;
-
-impl From<LabelFailure> for ApiError {
-    fn from(f: LabelFailure) -> Self {
-        match f {
-            LabelFailure::Backend(e) => {
-                ApiError::backend_unavailable(format!("LLM backend failed: {e}"))
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_index_first_wins() {
+    fn results_map_positionally_in_order() {
         let content = r#"{"results":[{"label":"A"},{"label":"B"}]}"#;
         let out = parse_model_output(content, 2);
         assert_eq!(out[0].as_ref().unwrap().label, "A");

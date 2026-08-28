@@ -2,7 +2,7 @@
 name = "transaction-labeller"
 version = "0.2.0"
 edition = "2021"
-description = "Local LLM-based REST service that labels bank transactions with spending/income categories"
+description = "Local LLM-based REST service that labels bank transactions with dynamically generated category names"
 license = "MIT"
 
 [dependencies]
@@ -14,13 +14,10 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-futures = "0.3"
 rand = "0.8"
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

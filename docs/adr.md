@@ -1,7 +1,8 @@
 # ADR-001: Model selection — qwen3.5:4b
 
 Date: 2026-08-28
-Status: Accepted
+Status: Accepted (model choice stands; the slug premise in the original
+context was removed by ADR-005 — labels are dynamic)
 
 ## Context
 
@@ -9,8 +10,9 @@ The service must classify bank transactions locally (8 GB VRAM budget,
 RTX 3070 Ti, Fedora server, no cloud inference). Labels must be available in
 configurable languages; the primary data is a German bank export (Girokonto
 CSV: `Buchungsdatum`, `Verwendungszweck`, `Umsatztyp` = Ausgang/Eingang), so
-strong German understanding is a hard requirement. The LLM only picks a
-category slug from a fixed taxonomy; direction comes from the amount sign.
+strong German understanding is a hard requirement. (Originally framed as
+"pick a slug from a fixed taxonomy"; since ADR-005 the model invents the
+label, which only raises the bar on instruction following.)
 
 ## Decision
 
@@ -55,7 +57,7 @@ served via Ollama with `think: false`, `temperature: 0`, `num_ctx: 8192`.
 # ADR-002: Canonical slugs as API identity
 
 Date: 2026-08-28
-Status: Accepted
+Status: **Superseded by ADR-005** (labels are dynamic; no slugs, no taxonomy)
 
 ## Context
 
@@ -107,17 +109,20 @@ valid category string leave their slot empty → per-item retry → fallback.
 # ADR-004: Item-wise degradation, never wholesale failure
 
 Date: 2026-08-28
-Status: Accepted
+Status: Accepted (behavior stands; the fallback *mechanism* was reworded by
+ADR-005 — generic localized labels instead of taxonomy slugs, no status field)
 
 ## Decision
 
 - Primary call timeout → all-None for that chunk → per-item retry → fallback
-  (`other_income`/`other_expense`, `status: fallback_unknown`). The batch
-  request still returns 200.
+  label (since ADR-005: generic localized label chosen by amount sign). The
+  batch request still returns 200.
 - Backend unreachable / non-transient HTTP error after retries → 503 +
   `Retry-After: 5` for the whole request (nothing was labelled).
-- Invalid labels (not in taxonomy or wrong direction) → one individual retry
-  (semaphore-bounded), then fallback.
+- Empty/missing labels → one individual retry (semaphore-bounded), then
+  fallback. (The "invalid per taxonomy/direction" check died with the
+  taxonomy in ADR-005; the sanitizer's length bound and control-char
+  stripping replace it.)
 
 ## Consequences
 
