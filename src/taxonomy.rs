@@ -1,4 +1,3 @@
-use crate::model::Direction;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -149,6 +148,7 @@ impl Taxonomy {
         self.categories.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.categories.is_empty()
     }
@@ -170,15 +170,6 @@ impl Taxonomy {
     pub fn lookup_ci(&self, slug: &str) -> Option<&Category> {
         let lowered = slug.trim().to_lowercase();
         self.lookup(&lowered)
-    }
-
-    /// Localized names of all categories (prompt rendering). Direction filtering
-    /// happens in the prompt layer; both directions see the full list for context.
-    pub fn names_for(&self, _dir: Direction, lang: &str) -> Vec<(Slug, String)> {
-        self.categories
-            .iter()
-            .map(|c| (c.slug.clone(), c.display_name(lang).to_string()))
-            .collect()
     }
 }
 

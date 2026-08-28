@@ -17,12 +17,19 @@ pub struct LlmRequest {
     pub include_rationale: bool,
 }
 
-/// Raw parsed model output: results keyed by input index.
+/// Raw parsed model output: results keyed by input position.
 #[derive(Debug, Clone)]
 pub struct RawClassification {
     pub index: usize,
     pub category: String,
     pub rationale: Option<String>,
+}
+
+impl RawClassification {
+    #[allow(dead_code)]
+    pub fn index(&self) -> usize {
+        self.index
+    }
 }
 
 #[derive(Error, Debug, Clone)]

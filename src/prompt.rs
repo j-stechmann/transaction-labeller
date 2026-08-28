@@ -25,12 +25,6 @@ pub fn language_display(lang: &str) -> &str {
         .unwrap_or("English")
 }
 
-/// System prompt with taxonomy injected. Separate entry point so the LLM
-/// client can render it per-request language without owning a Taxonomy handle.
-pub fn system_prompt_text(lang: &str) -> String {
-    system_prompt(&crate::taxonomy::builtin(), lang)
-}
-
 /// Renders the system prompt: role, rules, taxonomy (localized), output contract.
 pub fn system_prompt(tax: &Taxonomy, lang: &str) -> String {
     let lang_name = language_display(lang);
@@ -67,10 +61,11 @@ pub fn user_prompt(txs: &[Transaction], include_rationale: bool) -> String {
     let mut s = String::with_capacity(256 * txs.len());
     s.push_str("Classify these transactions:\n");
     for (i, tx) in txs.iter().enumerate() {
-        s.push_str(&format!("[{}] date={}; amount={}; counterparty=<<{}>>; purpose=<<{}>>\n",
+        s.push_str(&format!("[{}] date={}; amount={}; currency={}; counterparty=<<{}>>; purpose=<<{}>>\n",
             i,
             tx.date,
             format_amount(tx.amount),
+            tx.currency,
             sanitize_field(&tx.counterparty),
             sanitize_field(&tx.purpose),
         ));
