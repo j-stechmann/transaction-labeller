@@ -27,7 +27,7 @@ impl Direction {
 }
 
 /// A single banking transaction to be labelled. `amount` must be finite
-/// (NaN/Infinity rejected at deserialization).
+/// (NaN and ±Infinity rejected at deserialization).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Transaction {
     pub id: String,
@@ -35,11 +35,23 @@ pub struct Transaction {
     pub counterparty: String,
     #[serde(default)]
     pub purpose: String,
+    #[serde(deserialize_with = "deserialize_finite")]
     pub amount: f64,
     #[serde(default = "default_currency")]
     pub currency: String,
     #[serde(default)]
     pub date: String,
+}
+
+fn deserialize_finite<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() {
+        return Err(serde::de::Error::custom("amount must be finite"));
+    }
+    Ok(v)
 }
 
 fn default_currency() -> String {
@@ -167,6 +179,11 @@ mod tests {
         let body = r#"{"id":"a","amount":NaN}"#;
         let res: Result<Transaction, _> = serde_json::from_str(body);
         assert!(res.is_err(), "NaN must be rejected");
+
+        // 1e999 overflows to inf in serde_json's arbitrary precision path
+        let body = r#"{"id":"a","amount":1e999}"#;
+        let res: Result<Transaction, _> = serde_json::from_str(body);
+        assert!(res.is_err(), "Infinity must be rejected");
 
         let body = r#"{"id":"a","amount":null}"#;
         let res: Result<Transaction, _> = serde_json::from_str(body);

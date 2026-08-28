@@ -1,9 +1,11 @@
 use crate::config::Config;
 use crate::model::Transaction;
 use crate::prompt;
+use crate::taxonomy::Taxonomy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -42,7 +44,7 @@ pub struct OllamaClient {
     num_ctx: u32,
     request_timeout: Duration,
     max_retries: u32,
-    taxonomy_slugs: Vec<String>,
+    taxonomy: Arc<Taxonomy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,7 +68,7 @@ struct ChatRequestBody {
 }
 
 impl OllamaClient {
-    pub fn new(cfg: &Config, taxonomy_slugs: Vec<String>) -> Self {
+    pub fn new(cfg: &Config, taxonomy: Taxonomy, _slugs: Vec<String>) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .build()
@@ -78,7 +80,7 @@ impl OllamaClient {
             num_ctx: cfg.num_ctx,
             request_timeout: Duration::from_secs(cfg.request_timeout_secs),
             max_retries: cfg.max_retries,
-            taxonomy_slugs,
+            taxonomy: Arc::new(taxonomy),
         }
     }
 
@@ -134,14 +136,15 @@ impl OllamaClient {
     }
 
     /// Classify one micro-batch. Retries transient failures with exponential
-    /// backoff + jitter; association with transactions is positional.
+    /// backoff + jitter; association with transactions is positional (the
+    /// model-echoed `index` is ignored for mapping).
     pub async fn classify_batch(
         &self,
         req: &LlmRequest,
     ) -> Result<Vec<Option<RawClassification>>, LlmError> {
-        let system = prompt::system_prompt_text(req.language.as_str());
+        let system = prompt::system_prompt(&self.taxonomy, &req.language);
         let user = prompt::user_prompt(&req.transactions, req.include_rationale);
-        let schema = prompt::response_schema(&self.taxonomy_slugs, req.include_rationale);
+        let schema = prompt::response_schema(&self.taxonomy.slugs(), req.include_rationale);
 
         let body = ChatRequestBody {
             model: self.model.clone(),
@@ -167,12 +170,16 @@ impl OllamaClient {
                     let parsed = parse_model_output(&content, req.transactions.len());
                     return Ok(parsed);
                 }
+                Err(e @ LlmError::Timeout(_)) => {
+                    // Timeout exhausted → per-item fallback upstream, not a 503.
+                    warn!(attempt, error = %e, "LLM call timed out; degrading item-wise");
+                    return Ok(vec![None; req.transactions.len()]);
+                }
                 Err(e) => {
                     let transient = matches!(
                         e,
                         LlmError::Unreachable(_)
-                            | LlmError::Timeout(_)
-                            | LlmError::Http { status: 500..=599, .. }
+                            | LlmError::Http { status: 429 | 500..=599, .. }
                     );
                     if !transient || attempt > self.max_retries {
                         return Err(e);
@@ -232,41 +239,42 @@ fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// Extracts a JSON object from model output, tolerating markdown fences and
-/// surrounding prose. Returns results mapped positionally: slot `i` corresponds
-/// to input transaction `i`; missing/invalid entries are `None`.
+/// surrounding prose. Tries successive `{` positions so prose containing a
+/// brace does not poison the parse. Returns results mapped positionally:
+/// slot `i` corresponds to input transaction `i`; missing/invalid entries are
+/// `None`. The model-echoed `index` is ignored for association.
 pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawClassification>> {
+    let mut out: Vec<Option<RawClassification>> = vec![None; expected_len];
     let Some(json_str) = extract_json(content) else {
         debug!(content = %content, "no JSON found in model output");
-        return vec![None; expected_len];
+        return out;
     };
 
     let value: Value = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
             debug!(error = %e, "model output is not valid JSON");
-            return vec![None; expected_len];
+            return out;
         }
     };
 
     let Some(items) = value.get("results").and_then(|r| r.as_array()) else {
-        return vec![None; expected_len];
+        return out;
     };
 
-    let mut out: Vec<Option<RawClassification>> = vec![None; expected_len];
-    for item in items {
-        let index = match item.get("index").and_then(|i| i.as_u64()) {
-            Some(i) if (i as usize) < expected_len => i as usize,
-            _ => continue,
-        };
+    for (pos, item) in items.iter().enumerate() {
+        if pos >= expected_len {
+            break;
+        }
         let category = match item.get("category").and_then(|c| c.as_str()) {
             Some(c) => c.trim().to_string(),
             None => continue,
         };
-        if out[index].is_some() {
-            continue; // first entry for an index wins
+        if out[pos].is_some() {
+            continue;
         }
-        out[index] = Some(RawClassification {
-            index,
+        out[pos] = Some(RawClassification {
+            index: pos,
             category,
             rationale: item
                 .get("rationale")
@@ -278,14 +286,33 @@ pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawC
     out
 }
 
-/// Finds the outermost JSON object in a string (skips markdown fences/prose).
-fn extract_json(content: &str) -> Option<&str> {
-    let start = content.find('{')?;
-    let bytes = content.as_bytes();
+/// Finds the first parseable JSON object in a string (skips markdown fences
+/// and prose; tries successive `{` candidates).
+fn extract_json(content: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(rel) = content[search_from..].find('{') {
+        let start = search_from + rel;
+        if let Some(candidate) = balanced_object(&content[start..]) {
+            if serde_json::from_str::<Value>(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// Returns the outermost balanced `{...}` at the start of `s`, respecting
+/// string literals and escapes.
+fn balanced_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
+    for (i, &b) in bytes.iter().enumerate() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -302,7 +329,7 @@ fn extract_json(content: &str) -> Option<&str> {
             b'}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(&content[start..=i]);
+                    return Some(s[..=i].to_string());
                 }
             }
             _ => {}
@@ -337,15 +364,29 @@ mod tests {
     fn parse_json_with_surrounding_prose() {
         let content = "Sure! {\"results\":[{\"index\":1,\"category\":\"housing\"}]} hope that helps";
         let out = parse_model_output(content, 3);
-        assert!(out[0].is_none());
-        assert_eq!(out[1].as_ref().unwrap().category, "housing");
+        // Positional: first result slot maps to first transaction regardless
+        // of the echoed index.
+        assert_eq!(out[0].as_ref().unwrap().category, "housing");
+        assert!(out[1].is_none());
+        assert!(out[2].is_none());
     }
 
     #[test]
-    fn out_of_range_and_missing_indices() {
+    fn echoed_indices_are_ignored() {
         let content = r#"{"results":[{"index":5,"category":"groceries"},{"category":"housing"},{"index":0}]}"#;
         let out = parse_model_output(content, 3);
-        assert!(out.iter().all(|o| o.is_none()), "invalid entries must not map");
+        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
+        assert_eq!(out[1].as_ref().unwrap().category, "housing");
+        // third entry has no category → stays unmapped
+        assert!(out[2].is_none());
+    }
+
+    #[test]
+    fn extra_results_beyond_input_are_dropped() {
+        let content = r#"{"results":[{"category":"groceries"},{"category":"dining"}]}"#;
+        let out = parse_model_output(content, 1);
+        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

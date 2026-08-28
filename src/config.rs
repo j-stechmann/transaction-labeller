@@ -165,8 +165,10 @@ mod tests {
 
     #[test]
     fn language_must_be_iso_code() {
-        let mut cfg = Config::default();
-        cfg.language = "german".to_string();
+        let cfg = Config {
+            language: "german".to_string(),
+            ..Config::default()
+        };
         let err = validate_language(&cfg);
         assert!(err.is_err());
     }

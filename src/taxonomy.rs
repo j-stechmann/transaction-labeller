@@ -94,6 +94,7 @@ pub fn builtin() -> Taxonomy {
 }
 
 impl Taxonomy {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(json: &str) -> Result<Self, TaxonomyError> {
         let raw: RawTaxonomy =
             serde_json::from_str(json).map_err(TaxonomyError::Parse)?;
