@@ -8,7 +8,7 @@ receives **only the label** — no fixed taxonomy, no slugs, no database.
 ## Goals
 
 - Label transactions with a short category name in a configurable language
-- Response contains nothing but the label (+ id, optional rationale, model)
+- Response contains nothing but the label
 - Parallel processing with bounded concurrency
 - Local inference within 8 GB VRAM
 
@@ -56,7 +56,7 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
   micro-batch's transactions. Fields are embedded with delimiters and
   control-character stripping (prompt-injection mitigation).
 - **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>`
-  (grammar-constrained: `results[].{index,label[,rationale]}`, label 1–64
+  (grammar-constrained: `results[].{index,label}`, label 1–64
   chars — no enum, labels are free-form). `num_ctx` explicit (default 8192),
   `num_predict` capped (768), `temperature` 0, `think` false,
   `keep_alive: "10m"`. Retries: 2 attempts (3 total) with exponential backoff
@@ -69,6 +69,9 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
   (model-echoed indices are never trusted). Empty/missing labels get one
   individual retry (semaphore-bounded), then a generic fallback label
   (`Sonstige Ausgaben`/`Sonstige Einnahmen`, localized for de/en).
+- **Minimal response**: the API returns `{"label": "…"}` /
+  `{"labels": […]}` — nothing else (no id echo, no model tag, no timing;
+  timing is logged, not returned).
 
 ## API
 
@@ -87,21 +90,22 @@ batch too large, `503` LLM backend unreachable/overloaded (with `Retry-After:
 `POST /v1/label` — single transaction; `POST /v1/label:batch` — up to
 `TL_MAX_BATCH` (default 100), input order preserved, item-wise fallback.
 
-Response (both endpoints):
+Response:
 
 ```json
-{
-  "results": [
-    { "id": "tx-1", "label": "Lebensmittel", "model": "qwen3.5:4b" }
-  ],
-  "batch_ms": 412
-}
+{"label": "Lebensmittel"}
 ```
 
-`label` is the only payload the client needs: the LLM-generated category
-name in the requested language. `rationale` appears only when
-`include_rationale: true` is set. `id` echoes the input. `model` names the
-Ollama model.
+or, for `POST /v1/label:batch`:
+
+```json
+{"labels": ["Lebensmittel", "Miete", "Einkommen"]}
+```
+
+The label is the only payload the client needs: the LLM-generated category
+name in the requested language. Input `id`s are used solely to reject
+duplicates within a request; batch results are positional (`labels[i]` ↔
+`transactions[i]`).
 
 Direction is *not* returned: it is implied by the amount sign and the model
 sees the signed amount.

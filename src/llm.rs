@@ -12,7 +12,6 @@ use tracing::{debug, warn};
 pub struct LlmRequest {
     pub transactions: Vec<Transaction>,
     pub language: String,
-    pub include_rationale: bool,
 }
 
 /// Raw parsed model output: slot `k` of the parsed vector corresponds to the
@@ -23,7 +22,6 @@ pub struct LlmRequest {
 pub struct RawLabel {
     pub index: usize,
     pub label: String,
-    pub rationale: Option<String>,
 }
 
 #[derive(Error, Debug, Clone)]
@@ -150,8 +148,8 @@ impl OllamaClient {
         req: &LlmRequest,
     ) -> Result<Vec<Option<RawLabel>>, LlmError> {
         let system = prompt::system_prompt(&req.language);
-        let user = prompt::user_prompt(&req.transactions, req.include_rationale);
-        let schema = prompt::response_schema(req.include_rationale);
+        let user = prompt::user_prompt(&req.transactions);
+        let schema = prompt::response_schema();
 
         let body = ChatRequestBody {
             model: self.model.clone(),
@@ -287,15 +285,7 @@ pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawL
         if label.is_empty() || out[pos].is_some() {
             continue;
         }
-        out[pos] = Some(RawLabel {
-            index: pos,
-            label,
-            rationale: item
-                .get("rationale")
-                .and_then(|r| r.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-        });
+        out[pos] = Some(RawLabel { index: pos, label });
     }
     out
 }

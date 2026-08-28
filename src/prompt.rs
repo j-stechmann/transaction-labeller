@@ -45,7 +45,7 @@ pub fn system_prompt(lang: &str) -> String {
 }
 
 /// Renders the user prompt for one micro-batch of transactions.
-pub fn user_prompt(txs: &[Transaction], include_rationale: bool) -> String {
+pub fn user_prompt(txs: &[Transaction]) -> String {
     let mut s = String::with_capacity(256 * txs.len());
     s.push_str("Classify these transactions:\n");
     for (i, tx) in txs.iter().enumerate() {
@@ -58,9 +58,6 @@ pub fn user_prompt(txs: &[Transaction], include_rationale: bool) -> String {
             sanitize_field(&tx.counterparty),
             sanitize_field(&tx.purpose),
         ));
-    }
-    if include_rationale {
-        s.push_str("Include a short \"rationale\" (max 12 words) per result.\n");
     }
     s
 }
@@ -86,16 +83,7 @@ fn format_amount(a: f64) -> String {
 /// JSON schema used for Ollama structured output (grammar-constrained
 /// decoding). The label is a free string — the model invents it; length is
 /// bounded to keep responses compact.
-pub fn response_schema(include_rationale: bool) -> Value {
-    let mut item_props = serde_json::Map::new();
-    item_props.insert("index".into(), json!({"type": "integer", "minimum": 0}));
-    item_props.insert(
-        "label".into(),
-        json!({"type": "string", "minLength": 1, "maxLength": 64}),
-    );
-    if include_rationale {
-        item_props.insert("rationale".into(), json!({"type": "string"}));
-    }
+pub fn response_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -103,8 +91,11 @@ pub fn response_schema(include_rationale: bool) -> Value {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": item_props,
-                    "required": ["index", "label"],
+                    "properties": {
+                        "index": {"type": "integer", "minimum": 0},
+                        "label": {"type": "string", "minLength": 1, "maxLength": 64}
+                    },
+                    "required": ["index", "label"]
                 }
             }
         },
@@ -142,7 +133,7 @@ mod tests {
             tx("a", -10.0, "REWE", "Einkauf"),
             tx("b", 2500.0, "ACME GmbH", "Gehalt"),
         ];
-        let p = user_prompt(&txs, false);
+        let p = user_prompt(&txs);
         assert!(p.contains("[0]"));
         assert!(p.contains("[1]"));
         assert!(p.contains("REWE"));
@@ -163,15 +154,14 @@ mod tests {
 
     #[test]
     fn schema_has_no_enum_and_bounds_label_length() {
-        let schema = response_schema(false);
+        let schema = response_schema();
         let s = serde_json::to_string(&schema).unwrap();
         assert!(!s.contains("\"enum\""), "labels are dynamic, no enum");
         assert!(s.contains("maxLength"));
-        assert!(!s.contains("rationale"), "no rationale unless requested");
-        let schema_r = response_schema(true);
-        assert!(serde_json::to_string(&schema_r)
-            .unwrap()
-            .contains("rationale"));
+        assert!(
+            !s.contains("rationale"),
+            "no rationale: label-only response"
+        );
     }
 
     #[test]

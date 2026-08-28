@@ -1,6 +1,6 @@
 use crate::model::{
-    ApiError, BatchResponse, HealthResponse, LabelBatchRequest, LabelOptions, LabelSingleRequest,
-    Transaction,
+    ApiError, BatchLabelResponse, HealthResponse, LabelBatchRequest, LabelOptions,
+    LabelSingleRequest, SingleLabelResponse, Transaction,
 };
 use crate::pipeline::{LabelFailure, LabelService, RETRY_AFTER_SECS};
 use axum::extract::State;
@@ -92,7 +92,7 @@ fn api_err(err: ApiError, status: StatusCode, headers: Option<(&str, &str)>) -> 
     path = "/v1/label",
     request_body = LabelSingleRequest,
     responses(
-        (status = 200, description = "Transaction labelled with an LLM-generated category name", body = BatchResponse),
+        (status = 200, description = "The LLM-generated category name for the transaction", body = SingleLabelResponse),
         (status = 400, description = "Invalid input (bad language, over-long field)", body = ApiError),
         (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
         (status = 503, description = "LLM backend unreachable/overloaded; Retry-After: 5", body = ApiError)
@@ -118,16 +118,15 @@ pub async fn label_single(
     let language = body
         .options
         .effective_language(&state.service.default_language);
-    match state
-        .service
-        .label(
-            vec![body.transaction],
-            language,
-            body.options.include_rationale,
-        )
-        .await
-    {
-        Ok(batch) => (StatusCode::OK, Json(batch)).into_response(),
+    match state.service.label(vec![body.transaction], language).await {
+        Ok(batch) => match batch.labels.into_iter().next() {
+            Some(label) => (StatusCode::OK, Json(SingleLabelResponse { label })).into_response(),
+            None => api_err(
+                ApiError::new("internal", "no label produced"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+            ),
+        },
         Err(failure) => failure_to_response(failure),
     }
 }
@@ -138,7 +137,7 @@ pub async fn label_single(
     path = "/v1/label:batch",
     request_body = LabelBatchRequest,
     responses(
-        (status = 200, description = "Transactions labelled in parallel; input order preserved; items never fail wholesale (generic fallback label instead)", body = BatchResponse),
+        (status = 200, description = "One label per input transaction, in input order; items never fail wholesale (generic fallback label instead)", body = BatchLabelResponse),
         (status = 400, description = "Empty batch, duplicate ids, bad language, over-long fields", body = ApiError),
         (status = 413, description = "Batch exceeds TL_MAX_BATCH (default 100)", body = ApiError),
         (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
@@ -182,18 +181,14 @@ pub async fn label_batch(
         .options
         .effective_language(&state.service.default_language);
     let started = std::time::Instant::now();
-    match state
-        .service
-        .label(body.transactions, language, body.options.include_rationale)
-        .await
-    {
-        Ok(batch) => {
+    match state.service.label(body.transactions, language).await {
+        Ok(resp) => {
             info!(
-                items = batch.results.len(),
+                items = resp.labels.len(),
                 ms = started.elapsed().as_millis() as u64,
                 "batch labelled"
             );
-            (StatusCode::OK, Json(batch)).into_response()
+            (StatusCode::OK, Json(resp)).into_response()
         }
         Err(failure) => failure_to_response(failure),
     }
@@ -294,8 +289,8 @@ pub async fn vram_check_service(
             crate::model::LabelOptions,
             crate::model::LabelSingleRequest,
             crate::model::LabelBatchRequest,
-            crate::model::LabelResult,
-            crate::model::BatchResponse,
+            crate::model::SingleLabelResponse,
+            crate::model::BatchLabelResponse,
             crate::model::ApiError,
             crate::model::ErrorBody,
             crate::model::HealthResponse

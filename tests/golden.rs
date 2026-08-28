@@ -6,7 +6,7 @@
 //! 1. **Deterministic mode (default, `cargo test`)**: runs the golden set
 //!    through the full pipeline against the keyword-mapping mock LLM. This
 //!    verifies the prompt → parsing → mapping path preserves the contract
-//!    (positional order, localized labels, minimal response shape).
+//!    (positional order, localized labels).
 //! 2. **Live eval (`cargo test -- --ignored live_eval`)**: the full set is
 //!    labelled in ONE request against a real Ollama model at temperature 0
 //!    (single batch is required: with dynamic labels the model keeps wording
@@ -61,7 +61,7 @@ async fn run_through_pipeline(
     cases: &[GoldenCase],
     ollama_url: &str,
     micro_batch: usize,
-) -> Vec<(String, Value, GoldenExpectation)> {
+) -> Vec<(String, String, GoldenExpectation)> {
     let cfg = Config {
         ollama_url: ollama_url.to_string(),
         micro_batch,
@@ -76,7 +76,7 @@ async fn run_through_pipeline(
         .collect();
 
     let batch = service
-        .label(transactions, "de".to_string(), false)
+        .label(transactions, "de".to_string())
         .await
         .expect("backend works");
 
@@ -86,8 +86,7 @@ async fn run_through_pipeline(
         .map(|(i, c)| {
             let expectation: GoldenExpectation =
                 serde_json::from_value(c.expected.clone()).unwrap();
-            let result = serde_json::to_value(&batch.results[i]).unwrap();
-            (c.name.clone(), result, expectation)
+            (c.name.clone(), batch.labels[i].clone(), expectation)
         })
         .collect()
 }
@@ -105,25 +104,12 @@ async fn golden_pipeline_maps_positions_exactly() {
     let cases = load_golden();
     let results = run_through_pipeline(&cases, &m.url(), 4).await;
 
-    for (name, result, expected) in &results {
-        let case = cases.iter().find(|c| &c.name == name).unwrap();
-        let expected_id = case.transaction["id"].as_str().unwrap();
+    assert_eq!(results.len(), cases.len(), "one label per case");
+    for (name, label, expected) in &results {
         let expected_label = expected.labels()[0].clone();
         assert_eq!(
-            result["label"], expected_label,
+            label, &expected_label,
             "case {name}: label mismatch (positional association broken?)"
-        );
-        assert_eq!(result["id"], expected_id, "case {name}: id mismatch");
-        assert!(
-            result["rationale"].is_null(),
-            "case {name}: rationale must be absent unless requested"
-        );
-        // Minimal response shape: id, label, model (no rationale).
-        let obj = result.as_object().unwrap();
-        assert_eq!(
-            obj.len(),
-            3,
-            "case {name}: response must be minimal: {obj:?}"
         );
     }
 }
@@ -148,20 +134,19 @@ async fn live_eval() {
     let mut wrong: Vec<(String, Vec<String>, String)> = Vec::new();
 
     eprintln!("\n{:<28} {:<32} {:<28}", "case", "acceptable", "actual");
-    for (name, result, expected) in &results {
-        let actual = result["label"].as_str().unwrap_or("<none>");
+    for (name, label, expected) in &results {
         let acceptable = expected.labels();
-        let ok = acceptable.iter().any(|e| labels_match(actual, e));
+        let ok = acceptable.iter().any(|e| labels_match(label, e));
         if ok {
             correct += 1;
         } else {
-            wrong.push((name.clone(), acceptable.clone(), actual.to_string()));
+            wrong.push((name.clone(), acceptable.clone(), label.clone()));
         }
         eprintln!(
             "{:<28} {:<32} {:<28} {}",
             name,
             acceptable.join(" / "),
-            actual,
+            label,
             if ok { "ok" } else { "MISMATCH" }
         );
     }

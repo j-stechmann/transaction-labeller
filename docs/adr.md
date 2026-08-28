@@ -150,7 +150,7 @@ label**.
   fields are removed.
 - The model invents a short category label per transaction; the JSON schema
   constrains only the *shape* (`label` is a 1–64 char free string, no enum).
-- The response per transaction is `{id, label, [rationale], model}`.
+- The response per transaction is the label only (see ADR-007).
 - Fallback for unusable output is a generic localized label
   (`Sonstige Ausgaben`/`Sonstige Einnahmen`, English equivalents otherwise),
   chosen by the amount sign.
@@ -199,3 +199,34 @@ micro-batches are the wrong yardstick.
 - The eval measures "is the label a sensible category for this transaction in
   the requested language", not "did the model choose my preferred wording" —
   which matches the product requirement that wording is the model's choice.
+
+# ADR-007: Label-only responses (amends ADR-005)
+
+Date: 2026-08-28
+Status: Accepted
+
+## Context
+
+v0.2.0's response per transaction was `{id, label, [rationale], model}` plus
+a `batch_ms` envelope field. The product owner asked for the returned JSON to
+be as simple as possible: "I really only need the label."
+
+## Decision
+
+- `POST /v1/label` → `{"label": "…"}`
+- `POST /v1/label:batch` → `{"labels": ["…", …]}` (positional, `labels[i]` ↔
+  `transactions[i]`)
+- Removed: id echo, `model` tag, `batch_ms`, and the `include_rationale`
+  option (rationale was opt-in metadata; nobody asked for it).
+- Input `id`s remain required and are used only to reject duplicates within
+  a request; batch association is positional.
+- Timing/latency is available in the structured logs instead of the response.
+
+## Consequences
+
+- The client contract is a single string per transaction — trivially
+  consumable.
+- Batch clients associate by index instead of by id echo; duplicate-id
+  rejection still guards against accidental double-submission.
+- OpenAPI schemas shrink to `SingleLabelResponse` / `BatchLabelResponse`,
+  each with exactly one property.
