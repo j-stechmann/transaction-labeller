@@ -1,6 +1,4 @@
-use crate::model::{
-    ApiError, ItemStatus, LabelOptions, LabelResult, Transaction,
-};
+use crate::model::{ApiError, ItemStatus, LabelOptions, Transaction};
 use crate::pipeline::{LabelFailure, LabelService, RETRY_AFTER_SECS};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -45,6 +43,34 @@ fn validate_language(opts: &LabelOptions, state: &ApiState) -> Result<(), ApiErr
     Ok(())
 }
 
+/// Caps string field lengths so a single transaction cannot blow the prompt
+/// context (design.md: prompts must survive `TL_NUM_CTX`).
+fn validate_field_lengths(txs: &[Transaction], max_len: usize) -> Result<(), ApiError> {
+    for (i, tx) in txs.iter().enumerate() {
+        let check = |name: &str, v: &str| {
+            if v.len() > max_len {
+                Err(ApiError::invalid_request(format!(
+                    "transaction {i} (id {:?}): field `{name}` exceeds {max_len} bytes",
+                    tx.id
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        check("id", &tx.id)?;
+        check("counterparty", &tx.counterparty)?;
+        check("purpose", &tx.purpose)?;
+        check("date", &tx.date)?;
+        if tx.currency.len() > 8 {
+            return Err(ApiError::invalid_request(format!(
+                "transaction {i} (id {:?}): field `currency` exceeds 8 bytes",
+                tx.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_ids(txs: &[Transaction]) -> Result<(), ApiError> {
     let mut seen = std::collections::HashSet::with_capacity(txs.len());
     for (i, tx) in txs.iter().enumerate() {
@@ -83,6 +109,9 @@ pub async fn label_single(
     if let Err(e) = validate_ids(std::slice::from_ref(&body.transaction)) {
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
+    if let Err(e) = validate_field_lengths(std::slice::from_ref(&body.transaction), state.max_field_len) {
+        return api_err(e, StatusCode::BAD_REQUEST, None);
+    }
 
     let language = body.options.effective_language(&state.service.default_language);
     match state
@@ -90,29 +119,9 @@ pub async fn label_single(
         .label(vec![body.transaction], language, body.options.include_rationale)
         .await
     {
-        Ok(mut batch) => match batch.results.pop() {
-            Some(result) => {
-                let resp = SingleResponse {
-                    result,
-                    latency_ms: batch.batch_ms,
-                };
-                (StatusCode::OK, Json(resp)).into_response()
-            }
-            None => api_err(
-                ApiError::new("internal", "no result produced"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                None,
-            ),
-        },
+        Ok(batch) => (StatusCode::OK, Json(batch)).into_response(),
         Err(failure) => failure_to_response(failure),
     }
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct SingleResponse {
-    #[serde(flatten)]
-    pub result: LabelResult,
-    pub latency_ms: u64,
 }
 
 /// POST /v1/label:batch — parallel labelling of up to `max_batch` transactions.
@@ -142,6 +151,9 @@ pub async fn label_batch(
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
     if let Err(e) = validate_ids(&body.transactions) {
+        return api_err(e, StatusCode::BAD_REQUEST, None);
+    }
+    if let Err(e) = validate_field_lengths(&body.transactions, state.max_field_len) {
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
 
@@ -200,15 +212,42 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Response {
     }
 }
 
-/// GET /v1/taxonomy — effective taxonomy with per-language display names.
-pub async fn taxonomy(State(state): State<Arc<ApiState>>) -> Response {
+/// GET /v1/taxonomy — effective taxonomy: slugs + localized display names.
+pub async fn taxonomy(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(q): axum::extract::Query<TaxonomyQuery>,
+) -> Response {
+    let lang = q
+        .language
+        .unwrap_or_else(|| state.service.default_language.clone());
+    if lang.len() != 2 || !lang.chars().all(|c| c.is_ascii_alphabetic()) {
+        return api_err(
+            ApiError::invalid_request("language must be a 2-letter ISO 639-1 code"),
+            StatusCode::BAD_REQUEST,
+            None,
+        );
+    }
     let cats: Vec<serde_json::Value> = state
         .service
         .taxonomy()
         .iter()
-        .map(|c| serde_json::json!({ "slug": c.slug }))
+        .map(|c| {
+            serde_json::json!({
+                "slug": c.slug,
+                "label": c.display_name(&lang),
+            })
+        })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!({ "categories": cats }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "language": lang, "categories": cats })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaxonomyQuery {
+    language: Option<String>,
 }
 
 /// VRAM advisory check: warn (or fail in strict mode) if model weights exceed

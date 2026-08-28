@@ -61,11 +61,12 @@ pub fn user_prompt(txs: &[Transaction], include_rationale: bool) -> String {
     let mut s = String::with_capacity(256 * txs.len());
     s.push_str("Classify these transactions:\n");
     for (i, tx) in txs.iter().enumerate() {
-        s.push_str(&format!("[{}] date={}; amount={}; currency={}; counterparty=<<{}>>; purpose=<<{}>>\n",
+        s.push_str(&format!(
+            "[{}] date={}; amount={}; currency={}; counterparty=<<{}>>; purpose=<<{}>>\n",
             i,
-            tx.date,
+            sanitize_field(&tx.date),
             format_amount(tx.amount),
-            tx.currency,
+            sanitize_field(&tx.currency),
             sanitize_field(&tx.counterparty),
             sanitize_field(&tx.purpose),
         ));

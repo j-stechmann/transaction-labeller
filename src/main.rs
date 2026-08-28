@@ -54,16 +54,44 @@ async fn main() {
 
     // Advisory VRAM budget check against the running Ollama instance.
     let strict = std::env::var("TL_STRICT_VRAM").map(|v| v == "1" || v == "true").unwrap_or(false);
-    if let Err(msg) = api::vram_check_service(&service, cfg.vram_budget_mb, false).await {
+    if let Err(msg) = api::vram_check_service(&service, cfg.vram_budget_mb, strict).await {
         error!("{msg}");
         if strict {
             std::process::exit(3);
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {}: {e}", cfg.bind_addr));
+    let listener = match tokio::net::TcpListener::bind(&cfg.bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("failed to bind {}: {e}", cfg.bind_addr);
+            std::process::exit(2);
+        }
+    };
     info!(addr = %cfg.bind_addr, "listening");
-    axum::serve(listener, app).await.expect("server runs");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server runs");
+}
+
+/// Resolves on Ctrl-C or SIGTERM so in-flight requests can finish.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("ctrl-c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("sigterm handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received");
 }

@@ -130,16 +130,21 @@ impl OllamaClient {
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default();
+        // Prefer an exact tag match; fall back to base-name match only if no
+        // exact match exists (avoids `4b` matching `4b-instruct`'s size).
+        let want_base = self.model.split(':').next().unwrap_or(&self.model);
+        let mut fallback_size = None;
         for tag in tags {
             let name = tag.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            // Ollama tags may include a ":latest" suffix
-            let base = name.split(':').next().unwrap_or(name);
-            let want = self.model.split(':').next().unwrap_or(&self.model);
-            if name == self.model || (base == want && name.starts_with(want)) {
+            if name == self.model {
                 return Ok(tag.get("size").and_then(|s| s.as_u64()));
             }
+            let base = name.split(':').next().unwrap_or(name);
+            if base == want_base && fallback_size.is_none() {
+                fallback_size = tag.get("size").and_then(|s| s.as_u64());
+            }
         }
-        Ok(None)
+        Ok(fallback_size)
     }
 
     /// Classify one micro-batch. Retries transient failures with exponential

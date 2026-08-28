@@ -9,6 +9,12 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::debug;
 
+/// Context for one validation pass: shared settings for all items in it.
+struct RenderCtx<'a> {
+    language: &'a str,
+    include_rationale: bool,
+}
+
 /// Orchestrates: chunking → semaphore-bounded concurrent LLM calls →
 /// validation → per-item retry → fallback. Association with input
 /// transactions is strictly positional.
@@ -107,17 +113,13 @@ impl LabelService {
 
         let mut slots: Vec<Vec<LabelResult>> = Vec::with_capacity(chunk_count);
         for handle in handles {
-            // JoinError (task panic) is an internal bug, not a backend outage.
             let (chunk, raw) = match handle.await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
-                    // Backend unreachable/HTTP: fail wholesale with 503.
-                    // Timeouts were already converted to all-None by the client.
+                    // Defensive: timeouts are converted to all-None upstream;
+                    // remaining backend errors fail wholesale with 503.
                     if matches!(e, LlmError::Timeout(_)) {
-                        let n = chunk_len_of_last(&slots, &transactions);
-                        let _ = n;
-                        // fall through to per-item fallback below
-                        (Vec::new(), vec![None; 0])
+                        continue;
                     } else {
                         return Err(LabelFailure::Backend(e));
                     }
@@ -158,15 +160,16 @@ impl LabelService {
         language: &str,
         include_rationale: bool,
     ) -> Vec<LabelResult> {
+        let ctx = RenderCtx { language, include_rationale };
         let mut out: Vec<Option<LabelResult>> = vec![None; chunk.len()];
         let mut needs_retry: Vec<(usize, Transaction)> = Vec::new();
 
         for (i, tx) in chunk.iter().enumerate() {
             let direction = Direction::from_amount(tx.amount, false);
             match raw.get(i).and_then(|r| r.as_ref()) {
-                Some(rc) => match self.resolve_slug(&rc.category, direction) {
+                Some(rc) => match self.resolve_slug(&rc.category, direction, tx.amount) {
                     Some(slug) => {
-                        out[i] = Some(self.make_result(tx, &slug, language, rc.rationale.clone(), ItemStatus::Ok, direction));
+                        out[i] = Some(self.make_result(tx, &slug, &ctx, rc.rationale.clone(), ItemStatus::Ok, direction));
                     }
                     None => needs_retry.push((i, tx.clone())),
                 },
@@ -177,11 +180,11 @@ impl LabelService {
         // Individual retries for invalid/missing items (semaphore-bounded).
         for (i, tx) in needs_retry {
             let direction = Direction::from_amount(tx.amount, false);
-            let outcome = self.classify_single(&tx, language, include_rationale).await;
-            let resolved = outcome.and_then(|(cat, rat)| self.resolve_slug(&cat, direction).map(|s| (s, rat)));
+            let outcome = self.classify_single(&tx, ctx.language, ctx.include_rationale).await;
+            let resolved = outcome.and_then(|(cat, rat)| self.resolve_slug(&cat, direction, tx.amount).map(|s| (s, rat)));
             match resolved {
                 Some((slug, rationale)) => {
-                    out[i] = Some(self.make_result(&tx, &slug, language, rationale, ItemStatus::Ok, direction));
+                    out[i] = Some(self.make_result(&tx, &slug, &ctx, rationale, ItemStatus::Ok, direction));
                 }
                 None => {
                     debug!(id = %tx.id, "falling back after failed validation");
@@ -190,7 +193,7 @@ impl LabelService {
                     } else {
                         &self.fallback_expense
                     };
-                    out[i] = Some(self.make_result(&tx, fallback, language, None, ItemStatus::FallbackUnknown, direction));
+                    out[i] = Some(self.make_result(&tx, fallback, &ctx, None, ItemStatus::FallbackUnknown, direction));
                 }
             }
         }
@@ -200,12 +203,13 @@ impl LabelService {
             .collect()
     }
 
-    /// Slug is accepted only if it exists in the taxonomy AND matches the
-    /// transaction's direction (an income slug on an expense transaction is
-    /// a model error → retry).
-    fn resolve_slug(&self, raw_category: &str, direction: Direction) -> Option<String> {
+    /// Slug is accepted only if it exists in the taxonomy AND is consistent
+    /// with the transaction's direction. `amount == 0` transactions may take
+    /// either direction's slug (the sign carries no evidence, design.md §API).
+    fn resolve_slug(&self, raw_category: &str, direction: Direction, amount: f64) -> Option<String> {
         let cat = self.taxonomy.lookup_ci(raw_category)?;
-        if is_income_slug(&cat.slug) == (direction == Direction::Income) {
+        let slug_is_income = is_income_slug(&cat.slug);
+        if amount == 0.0 || slug_is_income == (direction == Direction::Income) {
             Some(cat.slug.clone())
         } else {
             None
@@ -236,7 +240,7 @@ impl LabelService {
         &self,
         tx: &Transaction,
         slug: &str,
-        language: &str,
+        ctx: &RenderCtx<'_>,
         rationale: Option<String>,
         status: ItemStatus,
         direction: Direction,
@@ -248,22 +252,14 @@ impl LabelService {
         LabelResult {
             id: tx.id.clone(),
             category: slug.to_string(),
-            category_label: cat.display_name(language).to_string(),
+            category_label: cat.display_name(ctx.language).to_string(),
             direction,
-            rationale: rationale.filter(|_| status == ItemStatus::Ok),
+            rationale: rationale
+                .filter(|_| ctx.include_rationale && status == ItemStatus::Ok),
             status,
             model: self.model.clone(),
         }
     }
-}
-
-/// A timeout from the primary call means those items degrade to fallback, not
-/// a 503. The client returns all-None for a fully failed call.
-fn chunk_len_of_last(
-    _slots: &[Vec<LabelResult>],
-    _transactions: &[Transaction],
-) -> usize {
-    0
 }
 
 /// Prefers `other_income`/`other_expense`; falls back to any slug whose name
@@ -354,16 +350,25 @@ mod tests {
     fn direction_mismatch_is_rejected() {
         let svc = LabelService::new(&cfg(), builtin());
         assert_eq!(
-            svc.resolve_slug("salary_income", Direction::Income).as_deref(),
+            svc.resolve_slug("salary_income", Direction::Income, -1.0).as_deref(),
             Some("salary_income")
         );
         assert_eq!(
-            svc.resolve_slug("SALARY_INCOME", Direction::Income).as_deref(),
+            svc.resolve_slug("SALARY_INCOME", Direction::Income, 100.0).as_deref(),
             Some("salary_income")
         );
         // income slug on expense tx → model error
-        assert!(svc.resolve_slug("salary_income", Direction::Expense).is_none());
-        assert!(svc.resolve_slug("nope", Direction::Expense).is_none());
+        assert!(svc.resolve_slug("salary_income", Direction::Expense, -50.0).is_none());
+        assert!(svc.resolve_slug("nope", Direction::Expense, -1.0).is_none());
+        // amount == 0: either direction allowed
+        assert_eq!(
+            svc.resolve_slug("salary_income", Direction::Expense, 0.0).as_deref(),
+            Some("salary_income")
+        );
+        assert_eq!(
+            svc.resolve_slug("groceries", Direction::Income, 0.0).as_deref(),
+            Some("groceries")
+        );
     }
 
     #[test]
