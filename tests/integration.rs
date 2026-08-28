@@ -23,6 +23,8 @@ async fn spawn_app(mock: &MockServer, cfg_overrides: &[(&str, &str)]) -> (String
 fn test_config(ollama_url: &str, env: &[(&str, &str)]) -> transaction_labeller::config::Config {
     let mut cfg = transaction_labeller::config::Config {
         ollama_url: ollama_url.to_string(),
+        // Hermetic default: tests opt in to a library file explicitly.
+        label_library: String::new(),
         ..transaction_labeller::config::Config::default()
     };
     for (k, v) in env {
@@ -222,6 +224,67 @@ async fn empty_labels_fall_back_itemwise() {
     assert_eq!(results[0]["label"], "Sonstige Ausgaben");
     assert_eq!(results[1]["id"], "b");
     assert_eq!(results[1]["label"], "Sonstige Einnahmen");
+}
+
+#[tokio::test]
+async fn fallback_labels_are_not_recorded_into_library() {
+    // Isolated library file for this test run.
+    let lib_path = std::env::temp_dir().join(format!(
+        "tl-it-fallback-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let b = MockBehaviour {
+        keyword_map: default_keyword_map(),
+        empty_labels: true, // every item degrades to the fallback label
+        ..MockBehaviour::default()
+    };
+    let m = spawn_with(b).await;
+    let cfg = test_config(&m.url(), &[]);
+    let cfg = transaction_labeller::config::Config {
+        label_library: lib_path.to_string_lossy().to_string(),
+        ..cfg
+    };
+    let service = Arc::new(LabelService::new(&cfg));
+    let app = transaction_labeller::router::build_router(Arc::clone(&service), cfg.max_batch);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let (status, body) = post_json(
+        &url,
+        "/v1/label:batch",
+        json!({"transactions": [tx("a", -5.0, "REWE", "x"), tx("b", 100.0, "ACME", "Gehalt")]}),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    // Every slot is filled with the fallback — but the library must stay
+    // empty, otherwise a flaky-backend burst would rank the generic label
+    // first and inject it into every future prompt.
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results[0]["label"], "Sonstige Ausgaben");
+    assert_eq!(results[1]["label"], "Sonstige Einnahmen");
+
+    let res = reqwest::Client::new()
+        .get(format!("{url}/v1/labels?language=de"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(
+        list["labels"],
+        json!([]),
+        "fallback labels must not be recorded"
+    );
+
+    let _ = std::fs::remove_file(&lib_path);
 }
 
 #[tokio::test]
@@ -450,13 +513,188 @@ async fn openapi_docs_are_served() {
 }
 
 #[tokio::test]
-async fn unreachable_backend_returns_503_with_retry_after() {
-    // App pointed at a closed port.
+async fn label_library_is_injected_recorded_and_served() {
+    // Isolated library file for this test run.
+    let lib_path = std::env::temp_dir().join(format!(
+        "tl-it-lib-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let b = MockBehaviour {
+        keyword_map: default_keyword_map(),
+        ..MockBehaviour::default()
+    };
+    let m = spawn_with(b).await;
+    let cfg = test_config(&m.url(), &[]);
+    let cfg = transaction_labeller::config::Config {
+        label_library: lib_path.to_string_lossy().to_string(),
+        ..cfg
+    };
+    let service = Arc::new(LabelService::new(&cfg));
+    let app = transaction_labeller::router::build_router(Arc::clone(&service), cfg.max_batch);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    // 1. Library starts empty: system prompt has no library section.
+    let client = reqwest::Client::new();
+    let (status, body) = post_json(
+        &url,
+        "/v1/label",
+        json!({"transaction": tx("t1", -5.0, "REWE", "Einkauf"), "options": {"language": "de"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["label"], "Lebensmittel");
+    {
+        let prompts = m.system_prompts.lock().await;
+        let sys = prompts.last().unwrap();
+        assert!(
+            !sys.contains("Existing category labels"),
+            "empty library must not inject a section: {sys}"
+        );
+    }
+
+    // 2. After labelling, the used label is recorded and served.
+    let res = client
+        .get(format!("{url}/v1/labels?language=de"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(list["labels"], json!(["Lebensmittel"]));
+
+    // 3. Second request: the system prompt now contains the library label
+    //    with the verbatim-reuse instruction.
+    let (_, body) = post_json(
+        &url,
+        "/v1/label",
+        json!({"transaction": tx("t2", -7.5, "EDEKA", "Einkauf"), "options": {"language": "de"}}),
+    )
+    .await;
+    assert_eq!(body["label"], "Lebensmittel");
+    {
+        let prompts = m.system_prompts.lock().await;
+        let sys = prompts.last().unwrap();
+        assert!(sys.contains("Existing category labels"), "{sys}");
+        assert!(sys.contains("Lebensmittel"), "{sys}");
+        assert!(sys.contains("EXACTLY"), "{sys}");
+    }
+
+    // 4. Language isolation: en list is still empty.
+    let res = client
+        .get(format!("{url}/v1/labels?language=en"))
+        .send()
+        .await
+        .unwrap();
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(list["labels"], json!([]));
+
+    // 5. Default language (server default `de`) needs no query param.
+    let res = client.get(format!("{url}/v1/labels")).send().await.unwrap();
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(list["labels"], json!(["Lebensmittel"]));
+
+    // 6. The file on disk holds the recorded label with count ≥ 1.
+    let text = std::fs::read_to_string(&lib_path).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert!(v["de"]["Lebensmittel"].as_u64().unwrap() >= 1);
+
+    // 7. Bad language code → 400.
+    let res = client
+        .get(format!("{url}/v1/labels?language=deutsch"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 400);
+
+    let _ = std::fs::remove_file(&lib_path);
+}
+
+#[tokio::test]
+async fn model_reuses_library_label_verbatim() {
+    let lib_path = std::env::temp_dir().join(format!(
+        "tl-it-reuse-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&lib_path, r#"{"de": {"Lebensmittel": 3}}"#).unwrap();
+
+    // The "model" ignores keywords and always answers with its own wording.
+    let b = MockBehaviour {
+        force_label: Some("Lebensmitteleinkauf".to_string()),
+        ..MockBehaviour::default()
+    };
+    let m = spawn_with(b).await;
+    let cfg = test_config(&m.url(), &[]);
+    let cfg = transaction_labeller::config::Config {
+        label_library: lib_path.to_string_lossy().to_string(),
+        ..cfg
+    };
+    let service = Arc::new(LabelService::new(&cfg));
+    let app = transaction_labeller::router::build_router(Arc::clone(&service), cfg.max_batch);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    // First call: model invents its own wording → it is recorded.
+    let (_, body) = post_json(
+        &url,
+        "/v1/label",
+        json!({"transaction": tx("t1", -5.0, "REWE", "x"), "options": {"language": "de"}}),
+    )
+    .await;
+    assert_eq!(body["label"], "Lebensmitteleinkauf");
+
+    // Second call: the system prompt lists BOTH labels.
+    let _ = post_json(
+        &url,
+        "/v1/label",
+        json!({"transaction": tx("t2", -6.0, "EDEKA", "x"), "options": {"language": "de"}}),
+    )
+    .await;
+    let prompts = m.system_prompts.lock().await;
+    let sys = prompts.last().unwrap();
+    assert!(
+        sys.contains("Lebensmittel\n") && sys.contains("Lebensmitteleinkauf"),
+        "{sys}"
+    );
+
+    let _ = std::fs::remove_file(&lib_path);
+}
+
+#[tokio::test]
+async fn disabled_library_is_none() {
     let cfg = test_config("http://127.0.0.1:9", &[]);
-    // speed up: no retries
+    let cfg = transaction_labeller::config::Config {
+        label_library: String::new(),
+        ..cfg
+    };
+    let service = Arc::new(LabelService::new(&cfg));
+    assert!(
+        service.library().is_none(),
+        "empty path must disable the library"
+    );
+}
+
+#[tokio::test]
+async fn unreachable_backend_returns_503_with_retry_after() {
+    let cfg = test_config("http://127.0.0.1:9", &[]);
+    // speed up: no retries; hermetic (no library file)
     let cfg = transaction_labeller::config::Config {
         max_retries: 0,
         request_timeout_secs: 2,
+        label_library: String::new(),
         ..cfg
     };
     let service = Arc::new(LabelService::new(&cfg));

@@ -151,6 +151,15 @@ pub struct LabelBatchRequest {
     pub options: LabelOptions,
 }
 
+/// `GET /v1/labels` response — the label library for one language.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LabelListResponse {
+    /// Known labels, most-used first. The model is instructed to reuse these
+    /// verbatim; new labels are appended automatically as they are used.
+    #[schema(example = json!(["Lebensmittel", "Miete", "Einkommen"]))]
+    pub labels: Vec<String>,
+}
+
 /// `GET /v1/health` response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {

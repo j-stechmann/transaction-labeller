@@ -1,4 +1,4 @@
-use crate::api::{health, label_batch, label_single, ApiDoc, ApiState};
+use crate::api::{health, label_batch, label_single, list_labels, ApiDoc, ApiState};
 use crate::pipeline::LabelService;
 use axum::routing::{get, post};
 use axum::Router;
@@ -19,6 +19,7 @@ pub fn build_router(service: Arc<LabelService>, max_batch: usize) -> Router {
     Router::new()
         .route("/v1/label", post(label_single))
         .route("/v1/label:batch", post(label_batch))
+        .route("/v1/labels", get(list_labels))
         .route("/v1/health", get(health))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)

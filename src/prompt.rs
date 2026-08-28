@@ -24,11 +24,13 @@ pub fn language_display(lang: &str) -> &str {
         .unwrap_or("English")
 }
 
-/// Renders the system prompt: role, rules, output contract. Labels are
-/// generated dynamically by the model — there is no fixed taxonomy.
-pub fn system_prompt(lang: &str) -> String {
+/// Renders the system prompt: role, rules, output contract, and — when the
+/// label library has entries for this language — the existing-label list the
+/// model must prefer. Labels are otherwise generated dynamically by the
+/// model; there is no fixed taxonomy.
+pub fn system_prompt(lang: &str, library_labels: &[String]) -> String {
     let lang_name = language_display(lang);
-    let mut s = String::with_capacity(1024);
+    let mut s = String::with_capacity(1536);
     s.push_str("You are a bank transaction classifier. ");
     s.push_str("For each transaction you receive, invent one short category label that best describes what the transaction is for.\n");
     s.push_str("Reply ONLY with a JSON object: {\"results\":[{\"index\":<int>,\"label\":\"<category name>\"}]} — one result per transaction, same order.\n");
@@ -41,6 +43,22 @@ pub fn system_prompt(lang: &str) -> String {
     s.push_str("- Reuse the same wording for the same kind of transaction (consistency within the batch matters).\n");
     s.push_str("- Choose the category by what the transaction is FOR, not by its wording.\n");
     s.push_str("- If nothing specific fits, use a generic label for outflows and a generic label for inflows.\n");
+    if !library_labels.is_empty() {
+        s.push_str("\nExisting category labels already in use");
+        if lang_name != "English" {
+            s.push_str(&format!(" (in {lang_name})"));
+        }
+        s.push_str(":\n");
+        for label in library_labels {
+            // Labels are one-per-line; strip newlines defensively even though
+            // the sanitizer already caps content.
+            let clean = label.replace(['\n', '\r'], " ");
+            s.push_str(&format!("- {clean}\n"));
+        }
+        s.push_str("\nRULES FOR EXISTING LABELS:\n");
+        s.push_str("- If one of these labels fits a transaction, you MUST use it EXACTLY as written (character-for-character).\n");
+        s.push_str("- Only invent a new label when none of the existing labels fits. New labels are added to the list automatically.\n");
+    }
     s
 }
 
@@ -118,13 +136,30 @@ mod tests {
 
     #[test]
     fn system_prompt_asks_for_language_and_dynamic_labels() {
-        let p = system_prompt("de");
+        let p = system_prompt("de", &[]);
         assert!(p.contains("German"));
         assert!(p.contains("label"));
         assert!(!p.contains("slug"), "no taxonomy slugs");
         assert!(!p.contains("Allowed categories"), "no fixed category list");
-        let p_en = system_prompt("en");
+        let p_en = system_prompt("en", &[]);
         assert!(p_en.contains("English"));
+    }
+
+    #[test]
+    fn system_prompt_injects_library_labels_verbatim() {
+        let labels = vec!["Lebensmittel".to_string(), "Miete".to_string()];
+        let p = system_prompt("de", &labels);
+        assert!(p.contains("Lebensmittel"));
+        assert!(p.contains("Miete"));
+        assert!(p.contains("EXACTLY"), "must instruct verbatim reuse");
+        assert!(!p.contains("Allowed categories"));
+    }
+
+    #[test]
+    fn empty_library_omits_library_section() {
+        let p = system_prompt("de", &[]);
+        assert!(!p.contains("Existing category labels"));
+        assert!(!p.contains("EXACTLY"));
     }
 
     #[test]

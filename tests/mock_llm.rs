@@ -25,6 +25,9 @@ pub struct MockBehaviour {
     pub rationale: bool,
     /// Emit empty labels (forces fallback path).
     pub empty_labels: bool,
+    /// If set, the mock answers with this label for every transaction —
+    /// used to verify verbatim reuse of library labels.
+    pub force_label: Option<String>,
 }
 
 pub struct MockServer {
@@ -35,6 +38,8 @@ pub struct MockServer {
     pub max_in_flight: Arc<AtomicUsize>,
     #[allow(dead_code)]
     pub behaviour: Arc<Mutex<MockBehaviour>>,
+    /// System prompts of all chat calls, in arrival order.
+    pub system_prompts: Arc<Mutex<Vec<String>>>,
 }
 
 /// Keyword → label mapping for realistic test data. Longest match wins;
@@ -96,12 +101,14 @@ pub async fn spawn_with(behaviour: MockBehaviour) -> MockServer {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let behaviour = Arc::new(Mutex::new(behaviour));
+    let system_prompts = Arc::new(Mutex::new(Vec::new()));
 
     let app = {
         let chat_calls = Arc::clone(&chat_calls);
         let in_flight = Arc::clone(&in_flight);
         let max_in_flight = Arc::clone(&max_in_flight);
         let behaviour = Arc::clone(&behaviour);
+        let system_prompts = Arc::clone(&system_prompts);
         axum::Router::new().route(
             "/api/chat",
             axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
@@ -109,10 +116,21 @@ pub async fn spawn_with(behaviour: MockBehaviour) -> MockServer {
                 let in_flight = Arc::clone(&in_flight);
                 let max_in_flight = Arc::clone(&max_in_flight);
                 let behaviour = Arc::clone(&behaviour);
+                let system_prompts = Arc::clone(&system_prompts);
                 async move {
                     chat_calls.fetch_add(1, Ordering::SeqCst);
                     let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     max_in_flight.fetch_max(cur, Ordering::SeqCst);
+
+                    if let Some(sys) = body
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        system_prompts.lock().await.push(sys.to_string());
+                    }
 
                     let b = behaviour.lock().await.clone();
                     if b.delay_ms > 0 {
@@ -128,6 +146,16 @@ pub async fn spawn_with(behaviour: MockBehaviour) -> MockServer {
                             .into_response()
                     } else if b.garbage {
                         axum::Json(json!({"message": {"content": "I cannot answer in JSON, sorry!"}}))
+                            .into_response()
+                    } else if let Some(forced) = &b.force_label {
+                        let user = body_user_prompt(&body);
+                        let n = user.lines().filter(|l| l.trim().starts_with('[')).count();
+                        let results: Vec<Value> = (0..n)
+                            .map(|i| json!({"index": i, "label": forced}))
+                            .collect();
+                        axum::Json(json!({
+                            "message": {"content": serde_json::to_string(&json!({"results": results})).unwrap()}
+                        }))
                             .into_response()
                     } else {
                         let user = body_user_prompt(&body);
@@ -164,6 +192,7 @@ pub async fn spawn_with(behaviour: MockBehaviour) -> MockServer {
         chat_calls,
         max_in_flight,
         behaviour,
+        system_prompts,
     }
 }
 
