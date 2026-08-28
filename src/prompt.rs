@@ -30,30 +30,26 @@ pub fn system_prompt(tax: &Taxonomy, lang: &str) -> String {
     let lang_name = language_display(lang);
     let mut s = String::with_capacity(2048);
     s.push_str("You are a bank transaction classifier. ");
+    s.push_str("For each transaction you receive, choose exactly one category from the allowed list.\n");
     s.push_str(&format!(
-        "For each transaction you receive, choose exactly one category from the allowed list and reply ONLY with a JSON object of the form {{\"results\":[{{\"index\":<int>,\"category\":\"<slug>\"{}}}]}}.\n",
-        if rationale_requested_static() { ",\"rationale\":\"<short reason>\"" } else { "" }
+        "Reply ONLY with a JSON object: {{\"results\":[{{\"index\":<int>,\"category\":\"<slug>\"}}]}} — one result per transaction, same order.\n"
     ));
     s.push_str("Rules:\n");
     s.push_str("- The response MUST be a single valid JSON object, no markdown, no extra text.\n");
-    s.push_str("- `index` is the 0-based position of the transaction in the input list.\n");
     s.push_str("- `category` MUST be one of the slugs listed below, copied exactly.\n");
     s.push_str(&format!(
         "- Category names are given in {lang_name}; the slug (left side) is what you output.\n"
     ));
     s.push_str("- Choose the category by what the transaction is FOR, not by its wording.\n");
+    s.push_str("- \"Gehalt\", \"Lohn\", \"Salary\", \"payroll\" are always salary_income, never transfers.\n");
+    s.push_str("- \"REWE\", \"EDEKA\", \"ALDI\", \"LIDL\", \"Netto\", \"Whole Foods\", \"supermarket\", \"Groceries\" are groceries.\n");
+    s.push_str("- \"Amazon Prime\" is a subscription only when the purpose names the Prime membership; plain Amazon orders are shopping.\n");
     s.push_str("- If nothing fits, use \"other_expense\" for outflows or \"other_income\" for inflows.\n\n");
     s.push_str("Allowed categories (slug = localized name):\n");
     for c in tax.iter() {
         s.push_str(&format!("- {} = {}\n", c.slug, c.display_name(lang)));
     }
     s
-}
-
-fn rationale_requested_static() -> bool {
-    // The system prompt is shared; rationale is requested per-request in the
-    // user prompt contract. Schema controls whether it is allowed.
-    false
 }
 
 /// Renders the user prompt for one micro-batch of transactions.
