@@ -71,6 +71,9 @@ struct ChatRequestBody {
     stream: bool,
     format: Value,
     keep_alive: String,
+    /// `false` disables the model's thinking mode: thinking models would burn
+    /// the entire `num_predict` budget on reasoning and never emit content.
+    think: bool,
     options: Value,
 }
 
@@ -167,6 +170,7 @@ impl OllamaClient {
             stream: false,
             format: schema,
             keep_alive: "10m".to_string(),
+            think: false,
             options: json!({
                 "num_ctx": self.num_ctx,
                 "temperature": 0.0,
