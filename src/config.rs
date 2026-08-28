@@ -180,6 +180,15 @@ mod tests {
     #[test]
     fn library_config_from_env() {
         let _guard = ENV_LOCK.lock().unwrap();
+        struct Cleanup(&'static [&'static str]);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for var in self.0 {
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+        let _cleanup = Cleanup(&["TL_LANGUAGE", "TL_LABEL_LIBRARY", "TL_LIBRARY_PROMPT_MAX"]);
         unsafe {
             std::env::set_var("TL_LANGUAGE", "en");
             std::env::set_var("TL_LABEL_LIBRARY", "/tmp/my-labels.json");
@@ -188,25 +197,26 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.label_library, "/tmp/my-labels.json");
         assert_eq!(cfg.library_prompt_max, 50);
-        unsafe {
-            std::env::remove_var("TL_LABEL_LIBRARY");
-            std::env::remove_var("TL_LIBRARY_PROMPT_MAX");
-        }
         // Empty path disables the library.
         unsafe {
             std::env::set_var("TL_LABEL_LIBRARY", "");
         }
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.label_library, "");
-        unsafe {
-            std::env::remove_var("TL_LABEL_LIBRARY");
-            std::env::remove_var("TL_LANGUAGE");
-        }
     }
 
     #[test]
     fn language_must_be_iso_code() {
         let _guard = ENV_LOCK.lock().unwrap();
+        struct Cleanup(&'static [&'static str]);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for var in self.0 {
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+        let _cleanup = Cleanup(&["TL_LANGUAGE"]);
         // Exercises the real from_env path end-to-end.
         unsafe {
             std::env::set_var("TL_LANGUAGE", "german");
@@ -217,8 +227,5 @@ mod tests {
         }
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.language, "en");
-        unsafe {
-            std::env::remove_var("TL_LANGUAGE");
-        }
     }
 }

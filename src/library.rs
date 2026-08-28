@@ -155,21 +155,12 @@ impl LabelLibrary {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             std::fs::write(to, text)
         };
-        let result = write(&tmp).and_then(|()| {
-            // Windows: `rename` fails when the destination exists → copy over
-            // (non-atomic on Windows; still crash-safe here because the tmp
-            // write completed first).
-            #[cfg(windows)]
-            {
-                if self.path.exists() {
-                    let copied = std::fs::copy(&tmp, &self.path).map(|_| ());
-                    let _ = std::fs::remove_file(&tmp);
-                    return copied;
-                }
-            }
-            std::fs::rename(&tmp, &self.path)
-        });
+        // `std::fs::rename` replaces an existing destination on all platforms
+        // (Windows uses MoveFileExW with MOVEFILE_REPLACE_EXISTING), so the
+        // write path stays atomic everywhere.
+        let result = write(&tmp).and_then(|()| std::fs::rename(&tmp, &self.path));
         if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
             warn!(path = %self.path.display(), error = %e, "failed to persist label library");
             return;
         }

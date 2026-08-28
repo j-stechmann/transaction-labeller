@@ -83,9 +83,9 @@ Client ──HTTP──▶     │ axum server (REST, /v1/…, Swagger UI)   │
   `{lang: {label: usage_count}}`, guarded by a `Mutex`, snapshotted per
   request. Read side: labels for the request language, most-used first,
   capped (`TL_LIBRARY_PROMPT_MAX`, default 200), injected into the system
-  prompt. Write side: after each successful chunk, every returned label is
-  recorded (count+1, new labels inserted) and persisted atomically
-  (temp file + rename). Missing file → start empty; corrupt file → warn +
+  prompt. Write side: once all chunks of a request succeed, every returned
+  label is recorded (count+1, new labels inserted) and persisted atomically
+  (temp file + rename); a partially-failed request records nothing. Missing file → start empty; corrupt file → warn +
   start empty; persistence errors are logged only — labelling never fails
    because of the library. `TL_LABEL_LIBRARY=""` or `TL_LIBRARY_PROMPT_MAX=0`
    disables it entirely (no injection, no writes, `GET /v1/labels` returns
