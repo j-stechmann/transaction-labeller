@@ -172,7 +172,7 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 | `TL_NUM_CTX` | `8192` | Ollama `num_ctx` (prompt window) |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file (empty = disabled) |
-| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels shown per prompt |
+| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels shown per prompt (`0` disables the library entirely) |
 | `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory VRAM budget |

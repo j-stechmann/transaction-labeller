@@ -66,7 +66,8 @@ impl LabelLibrary {
     }
 
     /// Existing labels for `language`, most-used first, capped at
-    /// `max_in_prompt`. Empty when the library is disabled.
+    /// `max_in_prompt`. Empty when the library is disabled
+    /// (`TL_LABEL_LIBRARY=""` or `TL_LIBRARY_PROMPT_MAX=0`).
     pub fn labels_for(&self, language: &str) -> Vec<String> {
         if self.max_in_prompt == 0 {
             return Vec::new();
@@ -88,7 +89,9 @@ impl LabelLibrary {
     /// Records labels that were actually returned for `language`: increments
     /// the usage count of known labels, inserts new ones. Persists the file;
     /// persistence errors are logged (in-memory state stays correct) and
-    /// never fail the labelling request.
+    /// never fail the labelling request. No-op when the library is disabled
+    /// (`max_in_prompt == 0`), so `TL_LIBRARY_PROMPT_MAX=0` disables the
+    /// library entirely, like `TL_LABEL_LIBRARY=""`.
     pub fn record(&self, language: &str, labels: &[String]) {
         if self.max_in_prompt == 0 || labels.is_empty() {
             return;
@@ -114,15 +117,9 @@ impl LabelLibrary {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             std::fs::write(to, text)
         };
-        if let Err(e) = write(&tmp).and_then(|()| {
-            std::fs::rename(&tmp, &self.path)?;
-            Ok(())
-        }) {
-            // Windows rename fails if the target exists; fall back to copy.
-            if write(&self.path).is_err() {
-                warn!(path = %self.path.display(), error = %e, "failed to persist label library");
-                return;
-            }
+        if let Err(e) = write(&tmp).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+            warn!(path = %self.path.display(), error = %e, "failed to persist label library");
+            return;
         }
         debug!(language, path = %self.path.display(), "label library persisted");
     }

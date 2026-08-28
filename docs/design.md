@@ -87,8 +87,9 @@ Client ──HTTP──▶     │ axum server (REST, /v1/…, Swagger UI)   │
   recorded (count+1, new labels inserted) and persisted atomically
   (temp file + rename). Missing file → start empty; corrupt file → warn +
   start empty; persistence errors are logged only — labelling never fails
-  because of the library. `TL_LABEL_LIBRARY=""` disables it entirely
-  (no injection, no writes, `GET /v1/labels` returns `[]`).
+   because of the library. `TL_LABEL_LIBRARY=""` or `TL_LIBRARY_PROMPT_MAX=0`
+   disables it entirely (no injection, no writes, `GET /v1/labels` returns
+   `[]`).
 - **Minimal response**: the API returns `{"id", "label"}` /
   `{"results": [{id, label}, …]}` — nothing else (no model tag, no timing;
   timing is logged, not returned). The id echo keeps association explicit.
@@ -147,7 +148,7 @@ sees the signed amount.
 | `TL_NUM_CTX` | `8192` | Ollama `options.num_ctx` per request |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file; empty disables the library |
-| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels injected per prompt |
+| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels injected per prompt; `0` disables the library entirely |
 | `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
