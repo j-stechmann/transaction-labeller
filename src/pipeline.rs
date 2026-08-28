@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::library::LabelLibrary;
 use crate::llm::{LlmError, LlmRequest, OllamaClient, RawLabel};
 use crate::model::{BatchLabelResponse, LabeledTransaction, Transaction};
 use std::sync::Arc;
@@ -15,6 +16,9 @@ pub struct LabelService {
     micro_batch: usize,
     /// Server-default label language (used when request omits `options.language`).
     pub default_language: String,
+    /// Existing labels shown to the model (prefer-reuse) and extended with
+    /// every label actually returned. `None` = library disabled.
+    library: Option<Arc<LabelLibrary>>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,18 +27,48 @@ pub enum LabelFailure {
     Backend(LlmError),
 }
 
+/// Outcome of validating one chunk: the positional results (fallbacks
+/// included — every slot must stay filled) plus the subset of labels the
+/// model actually produced, which is what the library records.
+struct ValidatedChunk {
+    results: Vec<LabeledTransaction>,
+    model_labels: Vec<String>,
+}
+
+/// True when `label` is one of the generic fallbacks for `language`. The
+/// shipped defaults are static strings, so this is exact. If a model happens
+/// to return the fallback wording on its own it is also skipped from
+/// recording — harmless (a generic label is never worth learning anyway).
+fn is_fallback_label(language: &str, label: &str) -> bool {
+    label == default_expense_label(language) || label == default_income_label(language)
+}
+
 impl LabelService {
     pub fn new(cfg: &Config) -> Self {
+        let library = if cfg.label_library.is_empty() {
+            None
+        } else {
+            Some(Arc::new(LabelLibrary::open(
+                std::path::PathBuf::from(&cfg.label_library),
+                cfg.library_prompt_max,
+            )))
+        };
         Self {
             client: Arc::new(OllamaClient::new(cfg)),
             semaphore: Arc::new(Semaphore::new(cfg.concurrency)),
             micro_batch: cfg.micro_batch,
             default_language: cfg.language.clone(),
+            library,
         }
     }
 
     pub fn client(&self) -> &OllamaClient {
         &self.client
+    }
+
+    /// Library access for the API (e.g. `GET /v1/labels`).
+    pub fn library(&self) -> Option<&Arc<LabelLibrary>> {
+        self.library.as_ref()
     }
 
     /// Labels a batch of transactions in parallel (micro-batched prompts).
@@ -49,6 +83,7 @@ impl LabelService {
         language: String,
     ) -> Result<BatchLabelResponse, LabelFailure> {
         let started = Instant::now();
+        let library_labels = self.library_labels(&language);
         let chunks: Vec<Vec<Transaction>> = transactions
             .chunks(self.micro_batch)
             .map(|c| c.to_vec())
@@ -60,6 +95,7 @@ impl LabelService {
             let client = Arc::clone(&self.client);
             let sem = Arc::clone(&self.semaphore);
             let lang = language.clone();
+            let library_labels = library_labels.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem
                     .acquire()
@@ -68,6 +104,7 @@ impl LabelService {
                 let req = LlmRequest {
                     transactions: chunk.clone(),
                     language: lang,
+                    library_labels,
                 };
                 let res = client.classify_batch(&req).await;
                 drop(_permit);
@@ -84,6 +121,10 @@ impl LabelService {
         }
 
         let mut slots: Vec<Vec<LabeledTransaction>> = Vec::with_capacity(chunk_count);
+        // Labels learned per chunk, recorded only after *every* chunk
+        // succeeded — otherwise a hard backend failure in a later chunk
+        // (503 + client retry) would double-count the earlier chunks.
+        let mut pending_records: Vec<Vec<String>> = Vec::new();
         for handle in handles {
             let (chunk, raw) = match handle.await {
                 Ok(Ok(pair)) => pair,
@@ -98,7 +139,16 @@ impl LabelService {
                 continue;
             }
             let validated = self.validate_chunk(&chunk, raw, &language).await;
-            slots.push(validated);
+            pending_records.push(validated.model_labels);
+            slots.push(validated.results);
+        }
+        // Learn: only labels the model actually produced grow the library.
+        // Fallback labels are excluded so a flaky-backend burst cannot
+        // inflate the generic label into the top-ranked prompt entry.
+        if let Some(lib) = &self.library {
+            for labels in pending_records {
+                lib.record(&language, &labels);
+            }
         }
 
         let mut results: Vec<LabeledTransaction> = Vec::with_capacity(transactions.len());
@@ -115,15 +165,25 @@ impl LabelService {
         Ok(BatchLabelResponse { results })
     }
 
+    /// Library labels for `language` (empty when disabled).
+    fn library_labels(&self, language: &str) -> Vec<String> {
+        self.library
+            .as_ref()
+            .map(|lib| lib.labels_for(language))
+            .unwrap_or_default()
+    }
+
     /// Validates positional raw labels. Order is preserved: slot `i` of the
     /// output corresponds to `chunk[i]`. Empty/missing labels get one
-    /// individual retry, then a generic fallback label.
+    /// individual retry, then a generic fallback label. `model_labels` holds
+    /// only the labels the model produced (retries included), so callers can
+    /// record them without polluting the library with fallbacks.
     async fn validate_chunk(
         &self,
         chunk: &[Transaction],
         raw: Vec<Option<RawLabel>>,
         language: &str,
-    ) -> Vec<LabeledTransaction> {
+    ) -> ValidatedChunk {
         let mut out: Vec<Option<LabeledTransaction>> = vec![None; chunk.len()];
         let mut needs_retry: Vec<(usize, Transaction)> = Vec::new();
 
@@ -164,15 +224,25 @@ impl LabelService {
             }
         }
 
-        out.into_iter()
-            .map(|o| o.expect("every slot is filled"))
-            .collect()
+        let mut results = Vec::with_capacity(out.len());
+        let mut model_labels = Vec::new();
+        for o in out.into_iter().flatten() {
+            if !is_fallback_label(language, &o.label) {
+                model_labels.push(o.label.clone());
+            }
+            results.push(o);
+        }
+        ValidatedChunk {
+            results,
+            model_labels,
+        }
     }
 
     async fn classify_single(&self, tx: &Transaction, language: &str) -> Option<String> {
         let req = LlmRequest {
             transactions: vec![tx.clone()],
             language: language.to_string(),
+            library_labels: self.library_labels(language),
         };
         let _permit = self.semaphore.acquire().await.ok()?;
         let res = self.client.classify_batch(&req).await;
@@ -217,6 +287,10 @@ mod tests {
         Config {
             micro_batch: 2,
             concurrency: 2,
+            // Hermetic default: tests opt in to a library file explicitly
+            // (matches test_config in the integration tests; the default
+            // Config would create labels.json in the CWD).
+            label_library: String::new(),
             ..Config::default()
         }
     }
@@ -250,5 +324,19 @@ mod tests {
         let svc = LabelService::new(&cfg);
         let res = svc.label(vec![tx("a", -5.0, "X", "Y")], "de".into()).await;
         assert!(matches!(res, Err(LabelFailure::Backend(_))));
+    }
+
+    #[test]
+    fn is_fallback_label_detects_shipped_defaults_only() {
+        assert!(is_fallback_label("de", "Sonstige Ausgaben"));
+        assert!(is_fallback_label("de", "Sonstige Einnahmen"));
+        assert!(is_fallback_label("en", "Other expenses"));
+        assert!(is_fallback_label("en", "Other income"));
+        assert!(!is_fallback_label("de", "Lebensmittel"));
+        assert!(
+            !is_fallback_label("de", "Sonstige Ausgaben "),
+            "no trimming"
+        );
+        assert!(!is_fallback_label("fr", "Sonstige Ausgaben"));
     }
 }

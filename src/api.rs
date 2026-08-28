@@ -1,12 +1,13 @@
 use crate::model::{
-    ApiError, BatchLabelResponse, HealthResponse, LabelBatchRequest, LabelOptions,
-    LabelSingleRequest, SingleLabelResponse, Transaction,
+    ApiError, BatchLabelResponse, HealthResponse, LabelBatchRequest, LabelListResponse,
+    LabelOptions, LabelSingleRequest, SingleLabelResponse, Transaction,
 };
 use crate::pipeline::{LabelFailure, LabelService, RETRY_AFTER_SECS};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 use utoipa::OpenApi;
@@ -17,15 +18,22 @@ pub struct ApiState {
     pub max_field_len: usize,
 }
 
+/// Shared language-code check: trims, then requires a 2-letter ASCII code.
+/// Returns the normalized (trimmed) code; the caller lowercases when needed.
+fn valid_language_code(raw: &str) -> Result<&str, ApiError> {
+    let l = raw.trim();
+    if l.len() != 2 || !l.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(ApiError::invalid_request(format!(
+            "language must be a 2-letter ISO 639-1 code, got: {raw:?}"
+        )));
+    }
+    Ok(l)
+}
+
 /// Request-level validation shared by single + batch endpoints.
 fn validate_language(opts: &LabelOptions, state: &ApiState) -> Result<(), ApiError> {
     if let Some(lang) = &opts.language {
-        let l = lang.trim();
-        if l.len() != 2 || !l.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(ApiError::invalid_request(format!(
-                "language must be a 2-letter ISO 639-1 code, got: {lang:?}"
-            )));
-        }
+        valid_language_code(lang)?;
         let _ = state; // reserved for future checks
     }
     Ok(())
@@ -214,6 +222,47 @@ fn failure_to_response(failure: LabelFailure) -> Response {
     }
 }
 
+/// GET /v1/labels — the label library: labels already known for a language.
+/// These are the labels the model is instructed to reuse verbatim.
+#[utoipa::path(
+    get,
+    path = "/v1/labels",
+    params(
+        ("language" = Option<String>, Query, description = "ISO 639-1 code; defaults to the server language")
+    ),
+    responses(
+        (status = 200, description = "Known labels, most-used first", body = LabelListResponse),
+        (status = 400, description = "Bad language code", body = ApiError)
+    ),
+    tag = "labelling"
+)]
+pub async fn list_labels(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<LabelListQuery>,
+) -> Response {
+    let lang = match query_language(&state, &query) {
+        Ok(lang) => lang,
+        Err(e) => return api_err(e, StatusCode::BAD_REQUEST, None),
+    };
+    let labels = match state.service.library() {
+        Some(lib) => lib.labels_for(&lang),
+        None => Vec::new(),
+    };
+    (StatusCode::OK, Json(LabelListResponse { labels })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LabelListQuery {
+    pub language: Option<String>,
+}
+
+fn query_language(state: &ApiState, query: &LabelListQuery) -> Result<String, ApiError> {
+    match &query.language {
+        Some(l) => Ok(valid_language_code(l)?.to_lowercase()),
+        None => Ok(state.service.default_language.clone()),
+    }
+}
+
 /// GET /v1/health — liveness + backend reachability.
 #[utoipa::path(
     get,
@@ -281,13 +330,14 @@ pub async fn vram_check_service(
 #[openapi(
     info(
         title = "transaction-labeller",
-        version = "0.2.0",
+        version = "0.3.0",
         description = "Labels bank transactions with category names generated dynamically by a local LLM (Ollama). There is no fixed taxonomy: the model invents short, consistent labels in the requested language. Direction is implied by the amount sign; the client receives only the label.",
         license(name = "MIT")
     ),
     paths(
         crate::api::label_single,
         crate::api::label_batch,
+        crate::api::list_labels,
         crate::api::health
     ),
     components(
@@ -299,6 +349,7 @@ pub async fn vram_check_service(
             crate::model::SingleLabelResponse,
             crate::model::BatchLabelResponse,
             crate::model::LabeledTransaction,
+            crate::model::LabelListResponse,
             crate::model::ApiError,
             crate::model::ErrorBody,
             crate::model::HealthResponse

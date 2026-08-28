@@ -3,6 +3,7 @@ use tracing::{error, info, warn};
 
 mod api;
 mod config;
+mod library;
 mod llm;
 mod model;
 mod pipeline;
@@ -33,6 +34,7 @@ async fn main() {
         concurrency = cfg.concurrency,
         micro_batch = cfg.micro_batch,
         num_ctx = cfg.num_ctx,
+        label_library = %cfg.label_library,
         "starting transaction-labeller"
     );
 
@@ -71,6 +73,11 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server runs");
+
+    // Best-effort final persist of the label library.
+    if let Some(lib) = service.library() {
+        lib.flush();
+    }
 }
 
 /// Resolves on Ctrl-C or SIGTERM so in-flight requests can finish.

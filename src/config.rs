@@ -11,6 +11,10 @@ pub struct Config {
     pub request_timeout_secs: u64,
     pub max_retries: u32,
     pub max_batch: usize,
+    /// Path of the label-library JSON file; empty disables the library.
+    pub label_library: String,
+    /// Max library labels injected into a prompt (per language).
+    pub library_prompt_max: usize,
 }
 
 impl Default for Config {
@@ -27,6 +31,8 @@ impl Default for Config {
             request_timeout_secs: 30,
             max_retries: 2,
             max_batch: 100,
+            label_library: "labels.json".to_string(),
+            library_prompt_max: 200,
         }
     }
 }
@@ -96,6 +102,13 @@ impl Config {
         if let Ok(v) = std::env::var("TL_MAX_BATCH") {
             cfg.max_batch = parse_usize("TL_MAX_BATCH", &v, Some(1), Some(10_000))?;
         }
+        if let Ok(v) = std::env::var("TL_LABEL_LIBRARY") {
+            let v = v.trim().to_string();
+            cfg.label_library = v;
+        }
+        if let Ok(v) = std::env::var("TL_LIBRARY_PROMPT_MAX") {
+            cfg.library_prompt_max = parse_usize("TL_LIBRARY_PROMPT_MAX", &v, Some(0), Some(1000))?;
+        }
         if cfg.language.len() != 2 || !cfg.language.chars().all(|c| c.is_ascii_alphabetic()) {
             return Err(ConfigError::InvalidValue(format!(
                 "TL_LANGUAGE must be a 2-letter ISO 639-1 code, got: {}",
@@ -145,6 +158,8 @@ mod tests {
         assert_eq!(cfg.micro_batch, 8);
         assert_eq!(cfg.num_ctx, 8192);
         assert_eq!(cfg.language, "de");
+        assert_eq!(cfg.label_library, "labels.json");
+        assert_eq!(cfg.library_prompt_max, 200);
         // 4B model at Q4 (~3.4GB) + KV + overhead must fit 8GB budget
         assert!(cfg.vram_budget_mb >= 8192);
         assert!(cfg.request_timeout_secs >= 10);
@@ -159,8 +174,49 @@ mod tests {
         assert_eq!(parse_usize("X", " 42 ", None, None).unwrap(), 42);
     }
 
+    /// Serializes tests that mutate process env vars (they race otherwise).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn library_config_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        struct Cleanup(&'static [&'static str]);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for var in self.0 {
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+        let _cleanup = Cleanup(&["TL_LANGUAGE", "TL_LABEL_LIBRARY", "TL_LIBRARY_PROMPT_MAX"]);
+        unsafe {
+            std::env::set_var("TL_LANGUAGE", "en");
+            std::env::set_var("TL_LABEL_LIBRARY", "/tmp/my-labels.json");
+            std::env::set_var("TL_LIBRARY_PROMPT_MAX", "50");
+        }
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.label_library, "/tmp/my-labels.json");
+        assert_eq!(cfg.library_prompt_max, 50);
+        // Empty path disables the library.
+        unsafe {
+            std::env::set_var("TL_LABEL_LIBRARY", "");
+        }
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.label_library, "");
+    }
+
     #[test]
     fn language_must_be_iso_code() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        struct Cleanup(&'static [&'static str]);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for var in self.0 {
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+        let _cleanup = Cleanup(&["TL_LANGUAGE"]);
         // Exercises the real from_env path end-to-end.
         unsafe {
             std::env::set_var("TL_LANGUAGE", "german");
@@ -171,8 +227,5 @@ mod tests {
         }
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.language, "en");
-        unsafe {
-            std::env::remove_var("TL_LANGUAGE");
-        }
     }
 }

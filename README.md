@@ -3,18 +3,27 @@
 A local REST service that labels bank transactions with **category names
 generated dynamically by an LLM** via [Ollama](https://ollama.com) — no cloud
 inference, no data leaves the machine. The client receives **only the label**:
-there is no fixed taxonomy, no slug registry, no database. The LLM invents
-short, consistent category names in the language you request.
+there is no fixed taxonomy and no slug registry. The LLM invents short,
+consistent category names in the language you request — but it draws from a
+**label library**: a simple JSON file of labels already in use that the model
+must reuse verbatim when one fits. New wording is added to the library
+automatically, so labels stay stable across requests instead of drifting.
 
 ```
 Client ──HTTP──▶ axum REST API ──▶ pipeline (chunk → parallel LLM calls →
                                  sanitize → retry → fallback) ──▶ Ollama
+                                        │
+                                        ▼
+                              labels.json (label library)
 ```
 
 ## Features
 
 - **Dynamic labels**: the LLM invents the category names (`Lebensmittel`,
   `Groceries`, `Miete`, …) — nothing is pre-determined
+- **Label library**: existing labels are injected into every prompt and the
+  model must reuse them verbatim when they fit; new labels are learned
+  automatically (JSON file, one `label: count` map per language)
 - **Only the label**: response is `{"id", "label"}` (single) / `{"results": [{id, label}, …]}` (batch) — nothing else
 - **REST API**: single + batch endpoints, uniform error envelope, health
 - **Parallel labelling**: transactions are chunked into micro-batches (several
@@ -110,6 +119,18 @@ one result per transaction, in input order (`results[i]` ↔
 that item receives a generic fallback label (`Sonstige Ausgaben` /
 `Sonstige Einnahmen`, English equivalents for other languages).
 
+### `GET /v1/labels`
+
+Inspect the label library: `?language=de` (defaults to the server language).
+Returns the labels the model is instructed to reuse, most-used first:
+
+```json
+{"labels": ["Lebensmittel", "Miete", "Einkommen"]}
+```
+
+The library file (`TL_LABEL_LIBRARY`, default `labels.json`) is created on
+first use; disable with `TL_LABEL_LIBRARY=""`.
+
 ### `GET /v1/health`
 
 Liveness + Ollama reachability. `200 {"status":"ok"}` or
@@ -128,9 +149,11 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 
 ### Response field semantics
 
-- `label` — the LLM-generated category name in the requested language.
-  Free-form: wording may vary between requests; only the language is
-  guaranteed. Normalize downstream if you need stable grouping.
+- `label` — the LLM-generated category name in the requested language. The
+  model draws from the label library and reuses established wording verbatim
+  when it fits, so wording is stable across requests once established;
+  genuinely new categories get fresh (auto-learned) labels. Normalize
+  downstream if you need additional grouping.
 - `id` — echoes the input transaction id, so association never depends on
   array position. (Ids must still be unique within a request; duplicates are
   rejected with 400.)
@@ -148,6 +171,8 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 | `TL_MICRO_BATCH` | `8` | Transactions per prompt |
 | `TL_NUM_CTX` | `8192` | Ollama `num_ctx` (prompt window) |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request |
+| `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file (empty = disabled) |
+| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels shown per prompt (`0` disables the library entirely) |
 | `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory VRAM budget |
@@ -161,7 +186,31 @@ VRAM math (default config): 3.4 GB weights + ≤ ~320 MB KV cache (4 × 8192 ctx
 Request `options.language` (ISO 639-1) or set `TL_LANGUAGE`. The system
 prompt instructs the model to write the entire label in that language; the
 generic fallback labels are localized for `de` and `en` and default to
-English otherwise.
+English otherwise. The label library is per language, so `Lebensmittel` (de)
+and `Groceries` (en) never interfere.
+
+## Label library
+
+`labels.json` (configurable) keeps one `label: usage-count` map per language:
+
+```json
+{
+  "de": { "Lebensmittel": 12, "Miete": 3 },
+  "en": { "Groceries": 1 }
+}
+```
+
+- **Read**: existing labels are injected into the system prompt; the model
+  must reuse a listed label verbatim when it fits and only invents new
+  wording when none does.
+- **Write**: every label actually returned is recorded (count incremented,
+  new labels added) and persisted atomically (temp file + rename). The file
+  is human-editable — tweak or delete entries freely; do it while the
+  service is stopped.
+- Corrupt/unreadable file → logged warning, library starts empty, labelling
+  keeps working.
+- Disable entirely with `TL_LABEL_LIBRARY=""` (no prompts change, nothing is
+  written).
 
 ## Testing
 
@@ -170,13 +219,14 @@ cargo test                                   # unit + integration + golden (mock
 cargo test -- --ignored live_eval --nocapture  # live eval against real Ollama (needs model)
 ```
 
-- **Unit tests**: config parsing, prompt rendering, schema generation,
-  positional label parsing (markdown fences, prose, brace-in-string),
-  label sanitization, fallback language selection.
+- **Unit tests**: config parsing, prompt rendering (incl. library injection),
+  schema generation, positional label parsing (markdown fences, prose,
+  brace-in-string), label sanitization, fallback language selection, label
+  library (load/record/persist/corruption/cap).
 - **Integration tests** (`tests/integration.rs`): full HTTP API against a
   mock Ollama (`tests/mock_llm.rs`) — API contract, minimal response shape,
   concurrency bounds, item-wise fallback, transient-500 retry, uniform
-  errors, OpenAPI spec content.
+  errors, OpenAPI spec content, label-library injection/recording/`/v1/labels`.
 - **Golden tests** (`tests/golden/`): 20 real-world-style transactions run
   through the pipeline; contract preservation asserted deterministically
   against the mock.
