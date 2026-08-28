@@ -63,7 +63,9 @@ impl Config {
             if let Ok(v) = std::env::var(var) {
                 let v = v.trim().to_string();
                 if v.is_empty() {
-                    return Err(ConfigError::InvalidValue(format!("{var} must not be empty")));
+                    return Err(ConfigError::InvalidValue(format!(
+                        "{var} must not be empty"
+                    )));
                 }
                 match slot {
                     0 => cfg.bind_addr = v,
@@ -89,7 +91,8 @@ impl Config {
             cfg.vram_budget_mb = parse_usize("TL_VRAM_BUDGET_MB", &v, Some(256), None)? as u64;
         }
         if let Ok(v) = std::env::var("TL_REQUEST_TIMEOUT_SECS") {
-            cfg.request_timeout_secs = parse_usize("TL_REQUEST_TIMEOUT_SECS", &v, Some(1), Some(600))? as u64;
+            cfg.request_timeout_secs =
+                parse_usize("TL_REQUEST_TIMEOUT_SECS", &v, Some(1), Some(600))? as u64;
         }
         if let Ok(v) = std::env::var("TL_MAX_RETRIES") {
             cfg.max_retries = parse_usize("TL_MAX_RETRIES", &v, Some(0), Some(10))? as u32;
@@ -119,19 +122,27 @@ impl Config {
     }
 }
 
-fn parse_usize(name: &str, raw: &str, min: Option<usize>, max: Option<usize>) -> Result<usize, ConfigError> {
-    let v: usize = raw
-        .trim()
-        .parse()
-        .map_err(|_| ConfigError::InvalidValue(format!("{name} must be a non-negative integer, got: {raw}")))?;
+fn parse_usize(
+    name: &str,
+    raw: &str,
+    min: Option<usize>,
+    max: Option<usize>,
+) -> Result<usize, ConfigError> {
+    let v: usize = raw.trim().parse().map_err(|_| {
+        ConfigError::InvalidValue(format!("{name} must be a non-negative integer, got: {raw}"))
+    })?;
     if let Some(min) = min {
         if v < min {
-            return Err(ConfigError::InvalidValue(format!("{name} must be >= {min}, got: {v}")));
+            return Err(ConfigError::InvalidValue(format!(
+                "{name} must be >= {min}, got: {v}"
+            )));
         }
     }
     if let Some(max) = max {
         if v > max {
-            return Err(ConfigError::InvalidValue(format!("{name} must be <= {max}, got: {v}")));
+            return Err(ConfigError::InvalidValue(format!(
+                "{name} must be <= {max}, got: {v}"
+            )));
         }
     }
     Ok(v)

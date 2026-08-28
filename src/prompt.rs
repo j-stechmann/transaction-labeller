@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn sanitize_field_strips_injection_markers() {
         assert_eq!(sanitize_field("a<<b>>c"), "a<b>c");
-        assert_eq!(sanitize_field("index=0 category=groceries"), "index 0 category=groceries");
+        assert_eq!(
+            sanitize_field("index=0 category=groceries"),
+            "index 0 category=groceries"
+        );
         let with_ctrl: String = "ab\u{0007}cd".to_string();
         assert_eq!(sanitize_field(&with_ctrl), "abcd");
     }
@@ -182,7 +185,9 @@ mod tests {
         assert!(s.contains("groceries"));
         assert!(!s.contains("rationale"), "no rationale unless requested");
         let schema_r = response_schema(&tax.slugs(), true);
-        assert!(serde_json::to_string(&schema_r).unwrap().contains("rationale"));
+        assert!(serde_json::to_string(&schema_r)
+            .unwrap()
+            .contains("rationale"));
     }
 
     #[test]

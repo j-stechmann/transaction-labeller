@@ -1,3 +1,4 @@
+use crate::model::Direction;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,6 +10,7 @@ pub type Slug = String;
 #[derive(Debug, Clone, Deserialize)]
 struct RawCategory {
     slug: String,
+    direction: Option<String>,
     /// Localized display names keyed by ISO 639-1 code.
     names: HashMap<String, String>,
 }
@@ -16,6 +18,8 @@ struct RawCategory {
 #[derive(Debug, Clone)]
 pub struct Category {
     pub slug: Slug,
+    /// Taxonomic direction this category belongs to.
+    pub direction: Direction,
     names: HashMap<String, String>,
 }
 
@@ -63,30 +67,32 @@ impl std::fmt::Display for TaxonomyError {
 impl std::error::Error for TaxonomyError {}
 
 /// Built-in default taxonomy (canonical display names in German, `en` provided).
+/// Every category carries an explicit direction; `direction` defaults by naming
+/// convention (`*_income` → income, otherwise expense) but should be stated.
 pub fn builtin() -> Taxonomy {
     let json = r#"{
         "categories": [
-            {"slug": "salary_income", "names": {"de": "Einkommen", "en": "Salary & Wages"}},
-            {"slug": "refund", "names": {"de": "Erstattung", "en": "Refunds"}},
-            {"slug": "transfer", "names": {"de": "Übertragung", "en": "Transfer"}},
-            {"slug": "other_income", "names": {"de": "Sonstige Einnahmen", "en": "Other Income"}},
+            {"slug": "salary_income", "direction": "income", "names": {"de": "Einkommen", "en": "Salary & Wages"}},
+            {"slug": "refund", "direction": "income", "names": {"de": "Erstattung", "en": "Refunds"}},
+            {"slug": "transfer", "direction": "income", "names": {"de": "Übertragung", "en": "Transfer"}},
+            {"slug": "other_income", "direction": "income", "names": {"de": "Sonstige Einnahmen", "en": "Other Income"}},
 
-            {"slug": "housing", "names": {"de": "Wohnen", "en": "Housing"}},
-            {"slug": "groceries", "names": {"de": "Lebensmittel", "en": "Groceries"}},
-            {"slug": "dining", "names": {"de": "Restaurant & Café", "en": "Dining & Cafés"}},
-            {"slug": "transport", "names": {"de": "Transport & Mobilität", "en": "Transport & Mobility"}},
-            {"slug": "shopping", "names": {"de": "Shopping", "en": "Shopping"}},
-            {"slug": "health", "names": {"de": "Gesundheit", "en": "Health"}},
-            {"slug": "leisure", "names": {"de": "Freizeit & Unterhaltung", "en": "Leisure & Entertainment"}},
-            {"slug": "subscriptions", "names": {"de": "Abos & Dienstleistungen", "en": "Subscriptions & Services"}},
-            {"slug": "insurance", "names": {"de": "Versicherungen", "en": "Insurance"}},
-            {"slug": "savings_investing", "names": {"de": "Sparen & Investieren", "en": "Savings & Investing"}},
-            {"slug": "education", "names": {"de": "Bildung", "en": "Education"}},
-            {"slug": "donations", "names": {"de": "Spenden", "en": "Donations"}},
-            {"slug": "taxes_fees", "names": {"de": "Steuern & Gebühren", "en": "Taxes & Fees"}},
-            {"slug": "cash_withdrawal", "names": {"de": "Bargeld", "en": "Cash Withdrawal"}},
-            {"slug": "credit_card_settlement", "names": {"de": "Kreditkartenabrechnung", "en": "Credit Card Settlement"}},
-            {"slug": "other_expense", "names": {"de": "Sonstige Ausgaben", "en": "Other Expenses"}}
+            {"slug": "housing", "direction": "expense", "names": {"de": "Wohnen", "en": "Housing"}},
+            {"slug": "groceries", "direction": "expense", "names": {"de": "Lebensmittel", "en": "Groceries"}},
+            {"slug": "dining", "direction": "expense", "names": {"de": "Restaurant & Café", "en": "Dining & Cafés"}},
+            {"slug": "transport", "direction": "expense", "names": {"de": "Transport & Mobilität", "en": "Transport & Mobility"}},
+            {"slug": "shopping", "direction": "expense", "names": {"de": "Shopping", "en": "Shopping"}},
+            {"slug": "health", "direction": "expense", "names": {"de": "Gesundheit", "en": "Health"}},
+            {"slug": "leisure", "direction": "expense", "names": {"de": "Freizeit & Unterhaltung", "en": "Leisure & Entertainment"}},
+            {"slug": "subscriptions", "direction": "expense", "names": {"de": "Abos & Dienstleistungen", "en": "Subscriptions & Services"}},
+            {"slug": "insurance", "direction": "expense", "names": {"de": "Versicherungen", "en": "Insurance"}},
+            {"slug": "savings_investing", "direction": "expense", "names": {"de": "Sparen & Investieren", "en": "Savings & Investing"}},
+            {"slug": "education", "direction": "expense", "names": {"de": "Bildung", "en": "Education"}},
+            {"slug": "donations", "direction": "expense", "names": {"de": "Spenden", "en": "Donations"}},
+            {"slug": "taxes_fees", "direction": "expense", "names": {"de": "Steuern & Gebühren", "en": "Taxes & Fees"}},
+            {"slug": "cash_withdrawal", "direction": "expense", "names": {"de": "Bargeld", "en": "Cash Withdrawal"}},
+            {"slug": "credit_card_settlement", "direction": "expense", "names": {"de": "Kreditkartenabrechnung", "en": "Credit Card Settlement"}},
+            {"slug": "other_expense", "direction": "expense", "names": {"de": "Sonstige Ausgaben", "en": "Other Expenses"}}
         ]
     }"#;
     Taxonomy::from_str(json).expect("built-in taxonomy must be valid")
@@ -95,8 +101,7 @@ pub fn builtin() -> Taxonomy {
 impl Taxonomy {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(json: &str) -> Result<Self, TaxonomyError> {
-        let raw: RawTaxonomy =
-            serde_json::from_str(json).map_err(TaxonomyError::Parse)?;
+        let raw: RawTaxonomy = serde_json::from_str(json).map_err(TaxonomyError::Parse)?;
         Self::build(raw.categories)
     }
 
@@ -138,10 +143,39 @@ impl Taxonomy {
                     "category {i} (`{slug}`): no names provided"
                 )));
             }
+            let direction = match rc.direction.as_deref() {
+                Some("income") => Direction::Income,
+                Some("expense") => Direction::Expense,
+                Some(other) => {
+                    return Err(TaxonomyError::Invalid(format!(
+                        "category {i} (`{slug}`): direction must be \"income\" or \"expense\", got {other:?}"
+                    )))
+                }
+                None => {
+                    // Default by naming convention: *_income → income.
+                    if slug.ends_with("_income") {
+                        Direction::Income
+                    } else if slug.ends_with("_expense") {
+                        Direction::Expense
+                    } else {
+                        return Err(TaxonomyError::Invalid(format!(
+                            "category {i} (`{slug}`): missing `direction` (income|expense); \
+                             it cannot be inferred from the slug"
+                        )));
+                    }
+                }
+            };
             by_slug.insert(slug.clone(), categories.len());
-            categories.push(Category { slug, names: rc.names });
+            categories.push(Category {
+                slug,
+                direction,
+                names: rc.names,
+            });
         }
-        Ok(Self { categories, by_slug })
+        Ok(Self {
+            categories,
+            by_slug,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -213,33 +247,58 @@ mod tests {
     fn custom_taxonomy_from_json() {
         let json = r#"{
             "categories": [
-                {"slug": "food", "names": {"en": "Food"}}
+                {"slug": "food", "direction": "expense", "names": {"en": "Food"}}
             ]
         }"#;
         let t = Taxonomy::from_str(json).unwrap();
         assert_eq!(t.len(), 1);
-        assert_eq!(t.lookup("food").unwrap().display_name("de"), "Food",
-            "falls back to the only provided name");
+        assert_eq!(
+            t.lookup("food").unwrap().display_name("de"),
+            "Food",
+            "falls back to the only provided name"
+        );
+        assert_eq!(
+            t.lookup("food").unwrap().direction,
+            crate::model::Direction::Expense
+        );
+    }
+
+    #[test]
+    fn missing_direction_rejected_unless_naming_convention() {
+        // no direction, slug gives no hint → rejected
+        let ambiguous = r#"{"categories":[{"slug":"food","names":{"en":"Food"}}]}"#;
+        assert!(Taxonomy::from_str(ambiguous).is_err());
+        // convention fallback: *_income
+        let conventional = r#"{"categories":[{"slug":"my_income","names":{"en":"My Income"}}]}"#;
+        let t = Taxonomy::from_str(conventional).unwrap();
+        assert_eq!(
+            t.lookup("my_income").unwrap().direction,
+            crate::model::Direction::Income
+        );
+        // bad direction value → rejected
+        let bad_dir =
+            r#"{"categories":[{"slug":"food","direction":"sideways","names":{"en":"Food"}}]}"#;
+        assert!(Taxonomy::from_str(bad_dir).is_err());
     }
 
     #[test]
     fn invalid_taxonomies_rejected() {
         // duplicate slug
         let dup = r#"{"categories":[
-            {"slug":"a","names":{"en":"A"}},
-            {"slug":"a","names":{"en":"B"}}]}"#;
+            {"slug":"a","direction":"expense","names":{"en":"A"}},
+            {"slug":"a","direction":"expense","names":{"en":"B"}}]}"#;
         assert!(matches!(
             Taxonomy::from_str(dup),
             Err(TaxonomyError::Invalid(_))
         ));
         // bad slug characters (model-facing enum must stay ASCII)
         let bad = r#"{"categories":[
-            {"slug":"Übertragung","names":{"en":"T"}}]}"#;
+            {"slug":"Übertragung","direction":"expense","names":{"en":"T"}}]}"#;
         assert!(Taxonomy::from_str(bad).is_err());
         // empty
         assert!(Taxonomy::from_str(r#"{"categories":[]}"#).is_err());
         // no names
-        let nonames = r#"{"categories":[{"slug":"a","names":{}}]}"#;
+        let nonames = r#"{"categories":[{"slug":"a","direction":"expense","names":{}}]}"#;
         assert!(Taxonomy::from_str(nonames).is_err());
     }
 }

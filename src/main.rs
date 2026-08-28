@@ -45,7 +45,12 @@ async fn main() {
         "starting transaction-labeller"
     );
 
-    if cfg.bind_addr.parse::<std::net::SocketAddr>().map(|a| !a.ip().is_loopback()).unwrap_or(false) {
+    if cfg
+        .bind_addr
+        .parse::<std::net::SocketAddr>()
+        .map(|a| !a.ip().is_loopback())
+        .unwrap_or(false)
+    {
         warn!("binding to a non-loopback address: this service has no authentication");
     }
 
@@ -53,7 +58,9 @@ async fn main() {
     let app = router::build_router(Arc::clone(&service), cfg.max_batch);
 
     // Advisory VRAM budget check against the running Ollama instance.
-    let strict = std::env::var("TL_STRICT_VRAM").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let strict = std::env::var("TL_STRICT_VRAM")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     if let Err(msg) = api::vram_check_service(&service, cfg.vram_budget_mb, strict).await {
         error!("{msg}");
         if strict {

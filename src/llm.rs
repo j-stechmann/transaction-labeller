@@ -191,7 +191,10 @@ impl OllamaClient {
                     let transient = matches!(
                         e,
                         LlmError::Unreachable(_)
-                            | LlmError::Http { status: 429 | 500..=599, .. }
+                            | LlmError::Http {
+                                status: 429 | 500..=599,
+                                ..
+                            }
                     );
                     if !transient || attempt > self.max_retries {
                         return Err(e);
@@ -227,7 +230,10 @@ impl OllamaClient {
             })?;
 
         let status = res.status();
-        let text = res.text().await.map_err(|e| LlmError::BadResponse(e.to_string()))?;
+        let text = res
+            .text()
+            .await
+            .map_err(|e| LlmError::BadResponse(e.to_string()))?;
         if !status.is_success() {
             return Err(LlmError::Http {
                 status: status.as_u16(),
@@ -366,7 +372,8 @@ mod tests {
 
     #[test]
     fn parse_markdown_fenced_json() {
-        let content = "Here you go:\n```json\n{\"results\":[{\"index\":0,\"category\":\"dining\"}]}\n```";
+        let content =
+            "Here you go:\n```json\n{\"results\":[{\"index\":0,\"category\":\"dining\"}]}\n```";
         let out = parse_model_output(content, 2);
         assert_eq!(out[0].as_ref().unwrap().category, "dining");
         assert!(out[1].is_none());
@@ -374,7 +381,8 @@ mod tests {
 
     #[test]
     fn parse_json_with_surrounding_prose() {
-        let content = "Sure! {\"results\":[{\"index\":1,\"category\":\"housing\"}]} hope that helps";
+        let content =
+            "Sure! {\"results\":[{\"index\":1,\"category\":\"housing\"}]} hope that helps";
         let out = parse_model_output(content, 3);
         // Positional: first result slot maps to first transaction regardless
         // of the echoed index.
@@ -403,22 +411,31 @@ mod tests {
 
     #[test]
     fn duplicate_index_first_wins() {
-        let content = r#"{"results":[{"index":0,"category":"groceries"},{"index":0,"category":"housing"}]}"#;
+        let content =
+            r#"{"results":[{"index":0,"category":"groceries"},{"index":0,"category":"housing"}]}"#;
         let out = parse_model_output(content, 1);
         assert_eq!(out[0].as_ref().unwrap().category, "groceries");
     }
 
     #[test]
     fn braces_inside_strings_are_tolerated() {
-        let content = r#"{"results":[{"index":0,"category":"groceries","rationale":"has } brace"}]}"#;
+        let content =
+            r#"{"results":[{"index":0,"category":"groceries","rationale":"has } brace"}]}"#;
         let out = parse_model_output(content, 1);
         assert_eq!(out[0].as_ref().unwrap().category, "groceries");
-        assert_eq!(out[0].as_ref().unwrap().rationale.as_deref(), Some("has } brace"));
+        assert_eq!(
+            out[0].as_ref().unwrap().rationale.as_deref(),
+            Some("has } brace")
+        );
     }
 
     #[test]
     fn garbage_yields_all_none() {
-        assert!(parse_model_output("no json at all", 2).iter().all(|o| o.is_none()));
-        assert!(parse_model_output("{\"results\": 5}", 2).iter().all(|o| o.is_none()));
+        assert!(parse_model_output("no json at all", 2)
+            .iter()
+            .all(|o| o.is_none()));
+        assert!(parse_model_output("{\"results\": 5}", 2)
+            .iter()
+            .all(|o| o.is_none()));
     }
 }

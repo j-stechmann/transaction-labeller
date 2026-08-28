@@ -8,6 +8,12 @@ pub enum Direction {
     Expense,
 }
 
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Direction {
     /// `amount == 0` defaults to expense unless overridden by the caller.
     pub fn from_amount(amount: f64, zero_is_income: bool) -> Self {

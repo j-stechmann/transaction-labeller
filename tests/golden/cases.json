@@ -1,0 +1,102 @@
+[
+  {
+    "name": "grocery_rewe",
+    "transaction": {"id": "g1", "counterparty": "REWE SAGT DANKE", "purpose": "Einkauf 14.02", "amount": -42.13, "currency": "EUR", "date": "2026-02-14"},
+    "expected": {"category": "groceries", "direction": "expense"}
+  },
+  {
+    "name": "grocery_english",
+    "transaction": {"id": "g2", "counterparty": "WHOLE FOODS MARKET", "purpose": "Groceries", "amount": -58.20, "currency": "USD", "date": "2026-03-01"},
+    "expected": {"category": "groceries", "direction": "expense"}
+  },
+  {
+    "name": "salary",
+    "transaction": {"id": "s1", "counterparty": "ACME GmbH", "purpose": "Gehalt Februar", "amount": 3120.0, "currency": "EUR", "date": "2026-02-28"},
+    "expected": {"category": "salary_income", "direction": "income"}
+  },
+  {
+    "name": "salary_english",
+    "transaction": {"id": "s2", "counterparty": "Globex Corporation", "purpose": "Salary payment", "amount": 4500.0, "currency": "EUR", "date": "2026-02-28"},
+    "expected": {"category": "salary_income", "direction": "income"}
+  },
+  {
+    "name": "rent",
+    "transaction": {"id": "r1", "counterparty": "Vonovia SE", "purpose": "Miete Februar + Nebenkosten", "amount": -980.0, "currency": "EUR", "date": "2026-02-01"},
+    "expected": {"category": "housing", "direction": "expense"}
+  },
+  {
+    "name": "netflix_subscription",
+    "transaction": {"id": "n1", "counterparty": "Netflix International B.V.", "purpose": "Netflix Standard-Abo", "amount": -13.99, "currency": "EUR", "date": "2026-02-05"},
+    "expected": {"category": "subscriptions", "direction": "expense"}
+  },
+  {
+    "name": "fuel",
+    "transaction": {"id": "f1", "counterparty": "Shell Deutschland", "purpose": "Tanken Autobahn", "amount": -71.5, "currency": "EUR", "date": "2026-02-09"},
+    "expected": {"category": "transport", "direction": "expense"}
+  },
+  {
+    "name": "atm_withdrawal",
+    "transaction": {"id": "a1", "counterparty": "Stadtsparkasse", "purpose": "Geldautomat Bargeldauszahlung", "amount": -100.0, "currency": "EUR", "date": "2026-02-10"},
+    "expected": {"category": "cash_withdrawal", "direction": "expense"}
+  },
+  {
+    "name": "credit_card_settlement",
+    "transaction": {"id": "c1", "counterparty": "Visa Card Services", "purpose": "Kreditkartenabrechnung 01/2026", "amount": -345.67, "currency": "EUR", "date": "2026-02-15"},
+    "expected": {"category": "credit_card_settlement", "direction": "expense"}
+  },
+  {
+    "name": "umlaut_purpose",
+    "transaction": {"id": "u1", "counterparty": "Apotheke am Römer", "purpose": "Medikamente verschreibungspflichtig", "amount": -23.45, "currency": "EUR", "date": "2026-02-11"},
+    "expected": {"category": "health", "direction": "expense"}
+  },
+  {
+    "name": "sepa_reference_in_purpose",
+    "transaction": {"id": "p1", "counterparty": "Amazon EU S.à r.l.", "purpose": "EREF+SEPA 20260214MREF Amazon Prime Mitgliedschaft", "amount": -89.9, "currency": "EUR", "date": "2026-02-14"},
+    "expected": {"category": "shopping", "direction": "expense"}
+  },
+  {
+    "name": "tax_office",
+    "transaction": {"id": "t1", "counterparty": "Finanzamt Frankfurt", "purpose": "Einkommensteuer Nachzahlung", "amount": -420.0, "currency": "EUR", "date": "2026-02-20"},
+    "expected": {"category": "taxes_fees", "direction": "expense"}
+  },
+  {
+    "name": "transfer_between_own",
+    "transaction": {"id": "tr1", "counterparty": "Jonathan Beispiel", "purpose": "Übertragung auf Tagesgeldkonto", "amount": -2000.0, "currency": "EUR", "date": "2026-02-25"},
+    "expected": {"category": "savings_investing", "direction": "expense"}
+  },
+  {
+    "name": "refund_incoming",
+    "transaction": {"id": "rf1", "counterparty": "Zalando SE", "purpose": "Erstattung Storno Bestellung 12345", "amount": 45.99, "currency": "EUR", "date": "2026-02-18"},
+    "expected": {"category": "refund", "direction": "income"}
+  },
+  {
+    "name": "dining",
+    "transaction": {"id": "d1", "counterparty": "Pizzeria Italiana", "purpose": "Abendessen mit Familie", "amount": -54.3, "currency": "EUR", "date": "2026-02-22"},
+    "expected": {"category": "dining", "direction": "expense"}
+  },
+  {
+    "name": "insurance",
+    "transaction": {"id": "i1", "counterparty": "Allianz Versicherungs-AG", "purpose": "Kfz-Versicherung Quartalsbeitrag", "amount": -185.0, "currency": "EUR", "date": "2026-02-03"},
+    "expected": {"category": "insurance", "direction": "expense"}
+  },
+  {
+    "name": "zero_amount_expense_default",
+    "transaction": {"id": "z1", "counterparty": "Unknown Merchant", "purpose": "Kartenzahlung 0 EUR Vorautorisierung", "amount": 0.0, "currency": "EUR", "date": "2026-02-14"},
+    "expected": {"category": "other_expense", "direction": "expense", "zero_amount": true}
+  },
+  {
+    "name": "donation",
+    "transaction": {"id": "do1", "counterparty": "Deutsches Rotes Kreuz", "purpose": "Spende Nothilfe Erdbeben", "amount": -50.0, "currency": "EUR", "date": "2026-02-16"},
+    "expected": {"category": "donations", "direction": "expense"}
+  },
+  {
+    "name": "education",
+    "transaction": {"id": "e1", "counterparty": "Volkshochschule Frankfurt", "purpose": "Kursgebühr Deutsch Intensiv", "amount": -199.0, "currency": "EUR", "date": "2026-02-07"},
+    "expected": {"category": "education", "direction": "expense"}
+  },
+  {
+    "name": "leisure",
+    "transaction": {"id": "l1", "counterparty": "Cineplex Kinobetriebe", "purpose": "Kinosessel Abendshow 2 Plätze", "amount": -27.0, "currency": "EUR", "date": "2026-02-21"},
+    "expected": {"category": "leisure", "direction": "expense"}
+  }
+]

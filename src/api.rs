@@ -109,14 +109,22 @@ pub async fn label_single(
     if let Err(e) = validate_ids(std::slice::from_ref(&body.transaction)) {
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
-    if let Err(e) = validate_field_lengths(std::slice::from_ref(&body.transaction), state.max_field_len) {
+    if let Err(e) =
+        validate_field_lengths(std::slice::from_ref(&body.transaction), state.max_field_len)
+    {
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
 
-    let language = body.options.effective_language(&state.service.default_language);
+    let language = body
+        .options
+        .effective_language(&state.service.default_language);
     match state
         .service
-        .label(vec![body.transaction], language, body.options.include_rationale)
+        .label(
+            vec![body.transaction],
+            language,
+            body.options.include_rationale,
+        )
         .await
     {
         Ok(batch) => (StatusCode::OK, Json(batch)).into_response(),
@@ -157,7 +165,9 @@ pub async fn label_batch(
         return api_err(e, StatusCode::BAD_REQUEST, None);
     }
 
-    let language = body.options.effective_language(&state.service.default_language);
+    let language = body
+        .options
+        .effective_language(&state.service.default_language);
     let started = std::time::Instant::now();
     match state
         .service
