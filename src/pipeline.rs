@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::library::LabelLibrary;
 use crate::llm::{LlmError, LlmRequest, OllamaClient, RawLabel};
 use crate::model::{BatchLabelResponse, LabeledTransaction, Transaction};
 use std::sync::Arc;
@@ -15,6 +16,9 @@ pub struct LabelService {
     micro_batch: usize,
     /// Server-default label language (used when request omits `options.language`).
     pub default_language: String,
+    /// Existing labels shown to the model (prefer-reuse) and extended with
+    /// every label actually returned. `None` = library disabled.
+    library: Option<Arc<LabelLibrary>>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,16 +29,30 @@ pub enum LabelFailure {
 
 impl LabelService {
     pub fn new(cfg: &Config) -> Self {
+        let library = if cfg.label_library.is_empty() {
+            None
+        } else {
+            Some(Arc::new(LabelLibrary::open(
+                std::path::PathBuf::from(&cfg.label_library),
+                cfg.library_prompt_max,
+            )))
+        };
         Self {
             client: Arc::new(OllamaClient::new(cfg)),
             semaphore: Arc::new(Semaphore::new(cfg.concurrency)),
             micro_batch: cfg.micro_batch,
             default_language: cfg.language.clone(),
+            library,
         }
     }
 
     pub fn client(&self) -> &OllamaClient {
         &self.client
+    }
+
+    /// Library access for the API (e.g. `GET /v1/labels`).
+    pub fn library(&self) -> Option<&Arc<LabelLibrary>> {
+        self.library.as_ref()
     }
 
     /// Labels a batch of transactions in parallel (micro-batched prompts).
@@ -49,6 +67,7 @@ impl LabelService {
         language: String,
     ) -> Result<BatchLabelResponse, LabelFailure> {
         let started = Instant::now();
+        let library_labels = self.library_labels(&language);
         let chunks: Vec<Vec<Transaction>> = transactions
             .chunks(self.micro_batch)
             .map(|c| c.to_vec())
@@ -60,6 +79,7 @@ impl LabelService {
             let client = Arc::clone(&self.client);
             let sem = Arc::clone(&self.semaphore);
             let lang = language.clone();
+            let library_labels = library_labels.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem
                     .acquire()
@@ -68,6 +88,7 @@ impl LabelService {
                 let req = LlmRequest {
                     transactions: chunk.clone(),
                     language: lang,
+                    library_labels,
                 };
                 let res = client.classify_batch(&req).await;
                 drop(_permit);
@@ -98,6 +119,12 @@ impl LabelService {
                 continue;
             }
             let validated = self.validate_chunk(&chunk, raw, &language).await;
+            // Learn: every label actually returned (not fallbacks) grows the
+            // library so future wording stays consistent.
+            if let Some(lib) = &self.library {
+                let used: Vec<String> = validated.iter().map(|r| r.label.clone()).collect();
+                lib.record(&language, &used);
+            }
             slots.push(validated);
         }
 
@@ -113,6 +140,14 @@ impl LabelService {
         );
 
         Ok(BatchLabelResponse { results })
+    }
+
+    /// Library labels for `language` (empty when disabled).
+    fn library_labels(&self, language: &str) -> Vec<String> {
+        self.library
+            .as_ref()
+            .map(|lib| lib.labels_for(language))
+            .unwrap_or_default()
     }
 
     /// Validates positional raw labels. Order is preserved: slot `i` of the
@@ -173,6 +208,7 @@ impl LabelService {
         let req = LlmRequest {
             transactions: vec![tx.clone()],
             language: language.to_string(),
+            library_labels: self.library_labels(language),
         };
         let _permit = self.semaphore.acquire().await.ok()?;
         let res = self.client.classify_batch(&req).await;
@@ -247,6 +283,7 @@ mod tests {
         cfg.ollama_url = "http://127.0.0.1:1".into(); // nothing listens
         cfg.request_timeout_secs = 1;
         cfg.max_retries = 0;
+        cfg.label_library = String::new(); // hermetic: no file I/O
         let svc = LabelService::new(&cfg);
         let res = svc.label(vec![tx("a", -5.0, "X", "Y")], "de".into()).await;
         assert!(matches!(res, Err(LabelFailure::Backend(_))));

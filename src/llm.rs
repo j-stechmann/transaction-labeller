@@ -12,6 +12,9 @@ use tracing::{debug, warn};
 pub struct LlmRequest {
     pub transactions: Vec<Transaction>,
     pub language: String,
+    /// Existing labels (from the label library) injected into the system
+    /// prompt so the model reuses established wording.
+    pub library_labels: Vec<String>,
 }
 
 /// Raw parsed model output: slot `k` of the parsed vector corresponds to the
@@ -147,7 +150,7 @@ impl OllamaClient {
         &self,
         req: &LlmRequest,
     ) -> Result<Vec<Option<RawLabel>>, LlmError> {
-        let system = prompt::system_prompt(&req.language);
+        let system = prompt::system_prompt(&req.language, &req.library_labels);
         let user = prompt::user_prompt(&req.transactions);
         let schema = prompt::response_schema();
 

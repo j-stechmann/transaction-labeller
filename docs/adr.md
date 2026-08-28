@@ -255,3 +255,67 @@ so clients don't tangle label↔transaction association with array mechanics.
 - Association is explicit and order-independent for clients; the pipeline
   still guarantees positional order as a second safety net.
 - Response remains minimal: two fields per transaction.
+
+# ADR-009: Label library — persisted reuse of existing labels
+
+Date: 2026-08-28
+Status: Accepted (amends ADR-005; keeps "no fixed taxonomy" intact)
+
+## Context
+
+ADR-005 made labels fully dynamic. The known trade-off: wording drifts
+across requests with batch composition (`Lebensmittel` vs `Einkauf` vs
+`Lebensmittelkauf` for the same groceries). The in-batch consistency
+instruction fixes single batches, but across requests/batches the model has
+no memory. The product owner wants consistency: if a suitable label already
+exists, the model should return **that** label instead of inventing a new
+variant — which implies remembering used labels somewhere.
+
+## Decision
+
+A **label library**: a single JSON file (`TL_LABEL_LIBRARY`, default
+`labels.json`) mapping language → `{label: usage_count}`.
+
+- **Read**: per request, the labels for the request language (most-used
+  first, capped at `TL_LIBRARY_PROMPT_MAX` = 200) are injected into the
+  system prompt with an explicit MUST-reuse-verbatim rule; inventing new
+  wording is allowed only when nothing fits.
+- **Write**: after each successful micro-batch, every label actually
+  returned is recorded (count incremented, new labels appended) and the file
+  is persisted atomically (temp file + rename; Windows copy fallback).
+- **Discovery**: read-only `GET /v1/labels?language=…` (server default
+  language when omitted).
+- **Failure posture**: missing/corrupt/unwritable file never fails a
+  labelling request — warn and continue (empty in-memory state; a corrupt
+  file is overwritten on the next persist).
+- **Opt-out**: `TL_LABEL_LIBRARY=""` restores exact ADR-005 behaviour
+  (no injection, no writes).
+- The library is *not* a taxonomy: it has no direction metadata, no slugs,
+  no validation role, and it grows only from what the model actually
+  produced (plus manual edits while the service is stopped). It constrains
+  wording preference, never the API contract.
+
+## Alternatives considered
+
+| Option | Verdict |
+|---|---|
+| No persistence, prompt-only consistency | Status quo of ADR-005; drift across requests remains. Rejected — this is the problem being solved. |
+| SQLite | Unnecessary machinery for a per-language string→count map; harder to inspect/edit by hand. Rejected. |
+| Vector/embedding similarity matching | Better fuzzy reuse, but a model + index for a 4 GB-VRAM local service is overkill; exact-match prompt injection achieves most of the benefit at zero cost. Rejected (revisit if wording variants proliferate). |
+| Fixed taxonomy (undo ADR-005) | Contradicts the core requirement that labels are the LLM's invention. Rejected. |
+
+## Consequences
+
+- Label wording stabilizes across requests once a wording is established;
+  the response contract (`{id, label}`) is unchanged.
+- The prompt grows with the library (bounded by `TL_LIBRARY_PROMPT_MAX`;
+  200 labels ≈ well under 2k tokens, safe at `num_ctx` 8192 with
+  `TL_MICRO_BATCH` 8).
+- Language isolation is inherent (per-language maps): German and English
+  libraries never mix.
+- Concurrent writes funnel through one `Mutex`; persistence is
+  best-effort — a failed disk write logs a warning and the in-memory state
+  stays authoritative.
+- Tests: prompt-injection assertions via captured system prompts in the
+  mock; library round-trip/corruption/cap unit tests; `/v1/labels`
+  integration coverage.

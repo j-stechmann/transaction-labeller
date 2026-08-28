@@ -2,22 +2,25 @@
 
 A Rust REST service that labels bank transactions with **category names
 generated dynamically by an LLM**, served locally via Ollama. The client
-receives **only the label** — no fixed taxonomy, no slugs, no database.
-8 GB VRAM budget on an RTX 3070 Ti; no cloud inference.
+receives **only the label** — no fixed taxonomy, no slugs. A **label library**
+(a plain JSON file of already-used labels) is injected into every prompt so
+the model reuses established wording instead of drifting. 8 GB VRAM budget on
+an RTX 3070 Ti; no cloud inference.
 
 ## Goals
 
 - Label transactions with a short category name in a configurable language
+- Reuse existing label wording (label library) instead of inventing variants
 - Response contains nothing but the label
 - Parallel processing with bounded concurrency
 - Local inference within 8 GB VRAM
 
 ## Non-goals
 
-- Fixed taxonomies / label registries (labels are the LLM's choice)
+- Fixed taxonomies / mandatory label registries (labels are the LLM's choice;
+  the library grows organically from what the model produces)
 - Training/fine-tuning
 - Bank-statement CSV parsing (input is structured JSON transactions)
-- Persistent storage of results
 
 ## Model selection (research summary)
 
@@ -33,28 +36,35 @@ Decision and full comparison in ADR-001. Default: **`qwen3.5:4b`**
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────┐
-Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
-                    │   ├── POST /v1/label  (single tx)       │
-                    │   ├── POST /v1/label:batch (parallel)   │
-                    │   └── GET  /v1/health                   │
-                    └───────────────┬─────────────────────────┘
-                          ┌─────────▼──────────┐
-                          │ LabelService        │
-                          └─────────┬──────────┘
-                    ┌───────────────┼────────────────┐
-              ┌─────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐
-              │ Prompt     │  │ LLM client  │  │ Label       │
-              │ builder    │  │ (Ollama,    │  │ sanitizer + │
-              │ (language, │  │  JSON schema│  │ retry +     │
-              │  rules)    │  │  format)    │  │ fallback    │
-              └────────────┘  └─────────────┘  └─────────────┘
+                     ┌─────────────────────────────────────────┐
+Client ──HTTP──▶     │ axum server (REST, /v1/…, Swagger UI)   │
+                     │   ├── POST /v1/label  (single tx)       │
+                     │   ├── POST /v1/label:batch (parallel)   │
+                     │   ├── GET  /v1/labels (library)         │
+                     │   └── GET  /v1/health                   │
+                     └───────────────┬─────────────────────────┘
+                           ┌─────────▼──────────┐
+                           │ LabelService        │
+                           └─────────┬──────────┘
+                     ┌───────────────┼────────────────┐
+               ┌─────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐
+               │ Prompt     │  │ LLM client  │  │ Label       │
+               │ builder    │  │ (Ollama,    │  │ sanitizer + │
+               │ (language, │  │  JSON schema│  │ retry +     │
+               │  library,  │  │  format)    │  │ fallback    │
+               │  rules)    │  └─────────────┘  └──────┬──────┘
+               └────────────┘                          │
+                        ▲                              │
+                        └──────────────────────────────┘
+                     labels.json (LabelLibrary: read + record)
 ```
 
 - **Prompt builder**: system prompt with output contract + labelling rules
-  (language, brevity, in-batch consistency); user prompt with the
-  micro-batch's transactions. Fields are embedded with delimiters and
-  control-character stripping (prompt-injection mitigation).
+  (language, brevity, in-batch consistency) and — when non-empty — the
+  label library for the request language with a MUST-reuse-verbatim
+  instruction; user prompt with the micro-batch's transactions. Fields are
+  embedded with delimiters and control-character stripping (prompt-injection
+  mitigation).
 - **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>`
   (grammar-constrained: `results[].{index,label}`, label 1–64
   chars — no enum, labels are free-form). `num_ctx` explicit (default 8192),
@@ -69,9 +79,20 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
   (model-echoed indices are never trusted). Empty/missing labels get one
   individual retry (semaphore-bounded), then a generic fallback label
   (`Sonstige Ausgaben`/`Sonstige Einnahmen`, localized for de/en).
+- **Label library** (`library.rs`): plain JSON file
+  `{lang: {label: usage_count}}`, guarded by a `Mutex`, snapshotted per
+  request. Read side: labels for the request language, most-used first,
+  capped (`TL_LIBRARY_PROMPT_MAX`, default 200), injected into the system
+  prompt. Write side: after each successful chunk, every returned label is
+  recorded (count+1, new labels inserted) and persisted atomically
+  (temp file + rename). Missing file → start empty; corrupt file → warn +
+  start empty; persistence errors are logged only — labelling never fails
+  because of the library. `TL_LABEL_LIBRARY=""` disables it entirely
+  (no injection, no writes, `GET /v1/labels` returns `[]`).
 - **Minimal response**: the API returns `{"id", "label"}` /
   `{"results": [{id, label}, …]}` — nothing else (no model tag, no timing;
   timing is logged, not returned). The id echo keeps association explicit.
+  `GET /v1/labels?language=…` exposes the library read-only.
 
 ## API
 
@@ -125,6 +146,8 @@ sees the signed amount.
 | `TL_MICRO_BATCH` | `8` | Transactions per prompt |
 | `TL_NUM_CTX` | `8192` | Ollama `options.num_ctx` per request |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
+| `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file; empty disables the library |
+| `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels injected per prompt |
 | `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
@@ -151,14 +174,18 @@ warn (exit non-zero with `TL_STRICT_VRAM`) if weights exceed
 
 ## Testing strategy
 
-1. **Unit tests** (in-crate): prompt building (language, rules), JSON schema
-   generation (no enum, label length bounds), response parsing/label
-   sanitization (fences, prose, brace-in-string, whitespace, length cap),
-   fallback language selection, config parsing.
+1. **Unit tests** (in-crate): prompt building (language, rules, library
+   injection + empty-library omission), JSON schema generation (no enum,
+   label length bounds), response parsing/label sanitization (fences, prose,
+   brace-in-string, whitespace, length cap), fallback language selection,
+   config parsing, label library (load, record/count, ordering, cap,
+   persistence round-trip, corrupt file, disabled mode).
 2. **Integration tests**: spin the axum app with a **mock LLM server** that
-   returns canned/adaptive JSON; assert end-to-end API behaviour, minimal
-   response shape, concurrency limits (mock delays + in-flight counters),
-   retry/fallback paths, OpenAPI spec content.
+   returns canned/adaptive JSON and captures system prompts; assert
+   end-to-end API behaviour, minimal response shape, concurrency limits
+   (mock delays + in-flight counters), retry/fallback paths, OpenAPI spec
+   content, and the label-library loop (empty → no injection; used labels
+   recorded + served via `/v1/labels`; injected verbatim afterwards).
 3. **Golden result tests**: `tests/golden/cases.json` — 20 real-world-style
    transactions (German, English) through the pipeline against the mock;
    exact positional/label/id assertions.
@@ -184,9 +211,12 @@ thiserror, futures, rand, utoipa + utoipa-swagger-ui (OpenAPI docs).
 
 ## Risks & mitigations
 
-- **Label wording drifts between requests** → inherent to dynamic labels;
-  mitigated by in-batch consistency instruction and temperature 0. Clients
-  normalize downstream if they need stable grouping.
+- **Label wording drifts between requests** → label library: existing labels
+  are injected and MUST be reused verbatim; new wording is learned
+  automatically. Remaining drift within the first occurrences is inherent.
+- **Library file lost/corrupt** → warning + start empty; the library
+  rebuilds itself from subsequent traffic; labelling never fails because of
+  it.
 - **Model emits empty/garbage labels** → grammar-constrained decoding
   (min/max length) + sanitizer + per-item retry + localized fallback label.
 - **Prompt injection via transaction fields** → field sanitization; worst

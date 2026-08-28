@@ -66,6 +66,8 @@ async fn run_through_pipeline(
         ollama_url: ollama_url.to_string(),
         micro_batch,
         concurrency: 1,
+        // Keep golden runs hermetic: no label-library file is read or written.
+        label_library: String::new(),
         ..Config::default()
     };
     let service = Arc::new(LabelService::new(&cfg));
@@ -101,6 +103,7 @@ async fn golden_pipeline_maps_positions_exactly() {
         ..MockBehaviour::default()
     };
     let m = spawn_with(b).await;
+    let _ = m.system_prompts; // captured but not asserted here
     let cases = load_golden();
     let results = run_through_pipeline(&cases, &m.url(), 4).await;
 
