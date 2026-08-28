@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 
 #[derive(Default, Clone)]
 pub struct MockBehaviour {
-    /// Keyword → slug mapping applied to the user prompt content.
+    /// Keyword → label mapping applied to the user prompt content
+    /// (German + English keywords → localized labels).
     pub keyword_map: HashMap<String, String>,
     /// Artificial delay per chat request (ms).
     pub delay_ms: u64,
@@ -22,8 +23,8 @@ pub struct MockBehaviour {
     pub garbage: bool,
     /// Include rationale entries in the response.
     pub rationale: bool,
-    /// Emit labels that are NOT in the taxonomy (forces fallback path).
-    pub invalid_labels: bool,
+    /// Emit empty labels (forces fallback path).
+    pub empty_labels: bool,
 }
 
 pub struct MockServer {
@@ -36,48 +37,48 @@ pub struct MockServer {
     pub behaviour: Arc<Mutex<MockBehaviour>>,
 }
 
-/// Keyword→slug mapping for realistic test data (German + English).
+/// Keyword → label mapping for realistic test data. Longest match wins;
+/// labels are in the language of the keyword (de keywords → de labels,
+/// en keywords → en labels).
 pub fn default_keyword_map() -> HashMap<String, String> {
     HashMap::from([
-        ("REWE", "groceries"),
-        ("EDEKA", "groceries"),
-        ("ALDI", "groceries"),
-        ("LIDL", "groceries"),
-        ("NETTO", "groceries"),
-        ("MIETE", "housing"),
-        ("Gehalt", "salary_income"),
-        ("GEHALT", "salary_income"),
-        ("LOHN", "salary_income"),
-        ("Salary", "salary_income"),
-        ("Salary payment", "salary_income"),
-        ("SPARKASSE", "transfer"),
-        ("DKB", "transfer"),
-        ("Amazon EU", "shopping"),
-        ("AMAZON", "shopping"),
-        ("ZALANDO", "shopping"),
-        ("Apotheke", "health"),
-        ("DB Vertrieb", "transport"),
-        ("SHELL", "transport"),
-        ("NETFLIX", "subscriptions"),
-        ("SPOTIFY", "subscriptions"),
-        ("RESTAURANT", "dining"),
-        ("PIZZA", "dining"),
-        ("Pizzeria", "dining"),
-        ("STARBUCKS", "dining"),
-        ("Bargeld", "cash_withdrawal"),
-        ("Geldautomat", "cash_withdrawal"),
-        ("Erstattung Storno", "refund"),
-        ("Rotes Kreuz", "donations"),
-        ("Kursgebühr", "education"),
-        ("Cineplex", "leisure"),
-        ("Kinosessel", "leisure"),
-        ("Miete", "housing"),
-        ("Allianz", "insurance"),
-        ("Einkommensteuer", "taxes_fees"),
-        ("Visa Card Services", "credit_card_settlement"),
-        ("Tagesgeld", "savings_investing"),
-        ("WHOLE FOODS", "groceries"),
-        ("Medikamente", "health"),
+        // de → de labels
+        ("REWE", "Lebensmittel"),
+        ("EDEKA", "Lebensmittel"),
+        ("ALDI", "Lebensmittel"),
+        ("LIDL", "Lebensmittel"),
+        ("NETTO", "Lebensmittel"),
+        ("Miete", "Wohnen"),
+        ("MIETE", "Wohnen"),
+        ("Gehalt", "Einkommen"),
+        ("GEHALT", "Einkommen"),
+        ("LOHN", "Einkommen"),
+        ("NETFLIX", "Abos"),
+        ("SPOTIFY", "Abos"),
+        ("SHELL", "Transport"),
+        ("TANKSTELLE", "Transport"),
+        ("Apotheke", "Gesundheit"),
+        ("Medikamente", "Gesundheit"),
+        ("Bargeld", "Bargeld"),
+        ("Geldautomat", "Bargeld"),
+        ("Erstattung Storno", "Erstattung"),
+        ("Rotes Kreuz", "Spenden"),
+        ("Kursgebühr", "Bildung"),
+        ("Kinosessel", "Freizeit"),
+        ("Cineplex", "Freizeit"),
+        ("Allianz", "Versicherungen"),
+        ("Einkommensteuer", "Steuern & Gebühren"),
+        ("Visa Card Services", "Kreditkartenabrechnung"),
+        ("Tagesgeld", "Sparen & Investieren"),
+        ("Amazon EU", "Shopping"),
+        ("ZALANDO", "Shopping"),
+        ("Pizzeria", "Restaurant"),
+        ("PIZZA", "Restaurant"),
+        ("STARBUCKS", "Restaurant"),
+        ("RESTAURANT", "Restaurant"),
+        // en → en labels
+        ("WHOLE FOODS", "Groceries"),
+        ("Salary payment", "Salary"),
     ])
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -199,12 +200,12 @@ fn classify_prompt(user_prompt: &str, behaviour: &MockBehaviour) -> Vec<Value> {
         let Ok(index) = idx_str.trim().parse::<usize>() else {
             continue;
         };
-        let category = if behaviour.invalid_labels {
-            "made_up_category".to_string()
+        let label = if behaviour.empty_labels {
+            "".to_string()
         } else {
             let upper = body.to_uppercase();
             let mut best: Option<(usize, &String)> = None;
-            for (kw, slug) in &behaviour.keyword_map {
+            for (kw, lab) in &behaviour.keyword_map {
                 let matched = body.contains(kw.as_str()) || upper.contains(&kw.to_uppercase());
                 if matched {
                     let better = match &best {
@@ -212,19 +213,19 @@ fn classify_prompt(user_prompt: &str, behaviour: &MockBehaviour) -> Vec<Value> {
                         None => true,
                     };
                     if better {
-                        best = Some((kw.len(), slug));
+                        best = Some((kw.len(), lab));
                     }
                 }
             }
-            best.map(|(_, slug)| slug.clone()).unwrap_or_else(|| {
+            best.map(|(_, lab)| lab.clone()).unwrap_or_else(|| {
                 if body.contains("amount=-") || body.contains("amount=0") {
-                    "other_expense".to_string()
+                    "Sonstige Ausgaben".to_string()
                 } else {
-                    "other_income".to_string()
+                    "Sonstige Einnahmen".to_string()
                 }
             })
         };
-        let mut item = json!({"index": index, "category": category});
+        let mut item = json!({"index": index, "label": label});
         if behaviour.rationale {
             item["rationale"] = json!("keyword match");
         }

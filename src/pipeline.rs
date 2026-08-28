@@ -1,32 +1,26 @@
 use crate::config::Config;
-use crate::llm::{LlmError, LlmRequest, OllamaClient, RawClassification};
-use crate::model::{ApiError, BatchResponse, Direction, ItemStatus, LabelResult, Transaction};
-use crate::taxonomy::Taxonomy;
+use crate::llm::{LlmError, LlmRequest, OllamaClient, RawLabel};
+use crate::model::{ApiError, BatchResponse, LabelResult, Transaction};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::debug;
 
 /// Context for one validation pass: shared settings for all items in it.
-struct RenderCtx<'a> {
-    language: &'a str,
+struct RenderCtx {
     include_rationale: bool,
 }
 
 /// Orchestrates: chunking → semaphore-bounded concurrent LLM calls →
-/// validation → per-item retry → fallback. Association with input
+/// label cleanup → per-item retry → fallback. Association with input
 /// transactions is strictly positional.
 pub struct LabelService {
     client: Arc<OllamaClient>,
-    taxonomy: Arc<Taxonomy>,
     semaphore: Arc<Semaphore>,
     micro_batch: usize,
     model: String,
     /// Server-default label language (used when request omits `options.language`).
     pub default_language: String,
-    /// Fallback slugs validated against the taxonomy at construction.
-    fallback_income: String,
-    fallback_expense: String,
 }
 
 #[derive(Debug, Clone)]
@@ -36,29 +30,14 @@ pub enum LabelFailure {
 }
 
 impl LabelService {
-    pub fn new(cfg: &Config, taxonomy: Taxonomy) -> Self {
-        // Fallback slugs must exist in the effective taxonomy (builtin or
-        // custom); otherwise a per-item fallback would panic later.
-        let fallback_income = pick_fallback(&taxonomy, Direction::Income).unwrap_or_else(|| {
-            panic!("taxonomy must contain a generic income category (looked for `other_income`)")
-        });
-        let fallback_expense = pick_fallback(&taxonomy, Direction::Expense).unwrap_or_else(|| {
-            panic!("taxonomy must contain a generic expense category (looked for `other_expense`)")
-        });
+    pub fn new(cfg: &Config) -> Self {
         Self {
-            client: Arc::new(OllamaClient::new(cfg, taxonomy.clone())),
-            taxonomy: Arc::new(taxonomy),
+            client: Arc::new(OllamaClient::new(cfg)),
             semaphore: Arc::new(Semaphore::new(cfg.concurrency)),
             micro_batch: cfg.micro_batch,
             model: cfg.model.clone(),
             default_language: cfg.language.clone(),
-            fallback_income,
-            fallback_expense,
         }
-    }
-
-    pub fn taxonomy(&self) -> &Taxonomy {
-        &self.taxonomy
     }
 
     pub fn client(&self) -> &OllamaClient {
@@ -68,9 +47,9 @@ impl LabelService {
     /// Labels a batch of transactions in parallel (micro-batched prompts).
     ///
     /// Primary calls run under the semaphore; per-item retries acquire their
-    /// own permit so concurrency stays bounded. Primary-call timeouts degrade
-    /// item-wise (fallback) instead of failing the whole request; only
-    /// unreachable-backend errors abort with 503.
+    /// own permit so concurrency stays bounded. Timeouts degrade item-wise
+    /// (fallback) instead of failing the whole request; only unreachable-
+    /// backend errors abort with 503.
     pub async fn label(
         &self,
         transactions: Vec<Transaction>,
@@ -113,6 +92,7 @@ impl LabelService {
             }));
         }
 
+        let ctx = RenderCtx { include_rationale };
         let mut slots: Vec<Vec<LabelResult>> = Vec::with_capacity(chunk_count);
         for handle in handles {
             let (chunk, raw) = match handle.await {
@@ -127,9 +107,7 @@ impl LabelService {
             if chunk.is_empty() {
                 continue;
             }
-            let validated = self
-                .validate_chunk(&chunk, raw, &language, include_rationale)
-                .await;
+            let validated = self.validate_chunk(&chunk, raw, &language, &ctx).await;
             slots.push(validated);
         }
 
@@ -144,79 +122,45 @@ impl LabelService {
         })
     }
 
-    /// Validates positional raw classifications against the taxonomy.
-    /// Order is preserved: slot `i` of `out` corresponds to `chunk[i]`.
-    /// Invalid/missing labels get one individual retry, then fallback.
+    /// Validates positional raw labels. Order is preserved: slot `i` of the
+    /// output corresponds to `chunk[i]`. Empty/missing labels get one
+    /// individual retry, then a generic fallback label.
     async fn validate_chunk(
         &self,
         chunk: &[Transaction],
-        raw: Vec<Option<RawClassification>>,
+        raw: Vec<Option<RawLabel>>,
         language: &str,
-        include_rationale: bool,
+        ctx: &RenderCtx,
     ) -> Vec<LabelResult> {
-        let ctx = RenderCtx {
-            language,
-            include_rationale,
-        };
         let mut out: Vec<Option<LabelResult>> = vec![None; chunk.len()];
         let mut needs_retry: Vec<(usize, Transaction)> = Vec::new();
 
         for (i, tx) in chunk.iter().enumerate() {
-            let direction = Direction::from_amount(tx.amount, false);
             match raw.get(i).and_then(|r| r.as_ref()) {
-                Some(rc) => match self.resolve_slug(&rc.category, direction, tx.amount) {
-                    Some(slug) => {
-                        out[i] = Some(self.make_result(
-                            tx,
-                            &slug,
-                            &ctx,
-                            rc.rationale.clone(),
-                            ItemStatus::Ok,
-                            direction,
-                        ));
-                    }
-                    None => needs_retry.push((i, tx.clone())),
-                },
+                Some(rl) => {
+                    out[i] = Some(self.make_result(tx, &rl.label, rl.rationale.clone(), ctx));
+                }
                 None => needs_retry.push((i, tx.clone())),
             }
         }
 
         // Individual retries for invalid/missing items (semaphore-bounded).
         for (i, tx) in needs_retry {
-            let direction = Direction::from_amount(tx.amount, false);
             let outcome = self
-                .classify_single(&tx, ctx.language, ctx.include_rationale)
+                .classify_single(&tx, language, ctx.include_rationale)
                 .await;
-            let resolved = outcome.and_then(|(cat, rat)| {
-                self.resolve_slug(&cat, direction, tx.amount)
-                    .map(|s| (s, rat))
-            });
-            match resolved {
-                Some((slug, rationale)) => {
-                    out[i] = Some(self.make_result(
-                        &tx,
-                        &slug,
-                        &ctx,
-                        rationale,
-                        ItemStatus::Ok,
-                        direction,
-                    ));
+            match outcome {
+                Some((label, rationale)) => {
+                    out[i] = Some(self.make_result(&tx, &label, rationale, ctx));
                 }
                 None => {
-                    debug!(id = %tx.id, "falling back after failed validation");
-                    let fallback = if direction == Direction::Income {
-                        &self.fallback_income
+                    debug!(id = %tx.id, "falling back after failed labelling");
+                    let fallback = if tx.amount < 0.0 {
+                        default_expense_label(language)
                     } else {
-                        &self.fallback_expense
+                        default_income_label(language)
                     };
-                    out[i] = Some(self.make_result(
-                        &tx,
-                        fallback,
-                        &ctx,
-                        None,
-                        ItemStatus::FallbackUnknown,
-                        direction,
-                    ));
+                    out[i] = Some(self.make_result(&tx, fallback, None, ctx));
                 }
             }
         }
@@ -224,24 +168,6 @@ impl LabelService {
         out.into_iter()
             .map(|o| o.expect("every slot is filled"))
             .collect()
-    }
-
-    /// Slug is accepted only if it exists in the taxonomy AND its taxonomic
-    /// direction is consistent with the transaction's direction. `amount == 0`
-    /// transactions may take either direction's slug (the sign carries no
-    /// evidence, design.md §API).
-    fn resolve_slug(
-        &self,
-        raw_category: &str,
-        direction: Direction,
-        amount: f64,
-    ) -> Option<String> {
-        let cat = self.taxonomy.lookup_ci(raw_category)?;
-        if amount == 0.0 || cat.direction == direction {
-            Some(cat.slug.clone())
-        } else {
-            None
-        }
     }
 
     async fn classify_single(
@@ -263,7 +189,7 @@ impl LabelService {
                 .first()
                 .cloned()
                 .flatten()
-                .map(|rc| (rc.category, rc.rationale)),
+                .map(|rl| (rl.label, rl.rationale)),
             Err(_) => None,
         }
     }
@@ -271,44 +197,44 @@ impl LabelService {
     fn make_result(
         &self,
         tx: &Transaction,
-        slug: &str,
-        ctx: &RenderCtx<'_>,
+        label: &str,
         rationale: Option<String>,
-        status: ItemStatus,
-        direction: Direction,
+        ctx: &RenderCtx,
     ) -> LabelResult {
-        let cat = self
-            .taxonomy
-            .lookup(slug)
-            .unwrap_or_else(|| panic!("slug `{slug}` must exist in taxonomy"));
         LabelResult {
             id: tx.id.clone(),
-            category: slug.to_string(),
-            category_label: cat.display_name(ctx.language).to_string(),
-            direction,
-            rationale: rationale.filter(|_| ctx.include_rationale && status == ItemStatus::Ok),
-            status,
+            label: label.to_string(),
+            rationale: rationale.filter(|_| ctx.include_rationale),
             model: self.model.clone(),
         }
     }
 }
 
-/// Prefers `other_income`/`other_expense`; falls back to any generic "other"
-/// category in the requested direction.
-fn pick_fallback(tax: &Taxonomy, dir: Direction) -> Option<String> {
-    let want = if dir == Direction::Income {
-        "other_income"
+/// Generic fallback labels when the LLM produced nothing usable. Language
+/// follows the request language for the shipped defaults.
+const DEFAULT_EXPENSE_LABEL_EN: &str = "Other expenses";
+const DEFAULT_INCOME_LABEL_EN: &str = "Other income";
+const DEFAULT_EXPENSE_LABEL_DE: &str = "Sonstige Ausgaben";
+const DEFAULT_INCOME_LABEL_DE: &str = "Sonstige Einnahmen";
+
+fn default_expense_label(language: &str) -> &'static str {
+    if language == "de" {
+        DEFAULT_EXPENSE_LABEL_DE
     } else {
-        "other_expense"
-    };
-    if tax.lookup(want).is_some() {
-        return Some(want.to_string());
+        DEFAULT_EXPENSE_LABEL_EN
     }
-    // Custom taxonomies: first slug containing "other" that matches direction.
-    tax.iter()
-        .find(|c| c.slug.contains("other") && c.direction == dir)
-        .map(|c| c.slug.clone())
 }
+
+fn default_income_label(language: &str) -> &'static str {
+    if language == "de" {
+        DEFAULT_INCOME_LABEL_DE
+    } else {
+        DEFAULT_INCOME_LABEL_EN
+    }
+}
+
+/// Retry-After value for 503 responses.
+pub const RETRY_AFTER_SECS: u64 = 5;
 
 impl From<LabelFailure> for ApiError {
     fn from(f: LabelFailure) -> Self {
@@ -320,13 +246,10 @@ impl From<LabelFailure> for ApiError {
     }
 }
 
-/// Retry-After value for 503 responses.
-pub const RETRY_AFTER_SECS: u64 = 5;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::taxonomy::builtin;
+    use crate::config::Config;
 
     fn cfg() -> Config {
         Config {
@@ -344,74 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn fallback_slugs_exist_in_builtin() {
-        let t = builtin();
-        assert!(t.lookup("other_income").is_some());
-        assert!(t.lookup("other_expense").is_some());
+    fn fallback_labels_by_direction_and_language() {
+        assert_eq!(default_expense_label("de"), "Sonstige Ausgaben");
+        assert_eq!(default_expense_label("en"), "Other expenses");
+        assert_eq!(default_income_label("de"), "Sonstige Einnahmen");
+        assert_eq!(default_income_label("en"), "Other income");
         assert_eq!(
-            pick_fallback(&t, Direction::Income).as_deref(),
-            Some("other_income")
-        );
-        assert_eq!(
-            pick_fallback(&t, Direction::Expense).as_deref(),
-            Some("other_expense")
-        );
-    }
-
-    #[test]
-    fn custom_taxonomy_needs_other_fallback() {
-        let json = r#"{"categories":[
-            {"slug":"salary_income","direction":"income","names":{"de":"Gehalt"}},
-            {"slug":"my_other_expense","direction":"expense","names":{"de":"Rest"}}
-        ]}"#;
-        let t = Taxonomy::from_str(json).unwrap();
-        assert_eq!(
-            pick_fallback(&t, Direction::Expense).as_deref(),
-            Some("my_other_expense")
-        );
-        assert!(
-            pick_fallback(&t, Direction::Income).is_none(),
-            "no generic income category → startup must fail"
-        );
-    }
-
-    #[test]
-    fn direction_mismatch_is_rejected() {
-        let svc = LabelService::new(&cfg(), builtin());
-        assert_eq!(
-            svc.resolve_slug("salary_income", Direction::Income, -1.0)
-                .as_deref(),
-            Some("salary_income")
-        );
-        assert_eq!(
-            svc.resolve_slug("SALARY_INCOME", Direction::Income, 100.0)
-                .as_deref(),
-            Some("salary_income")
-        );
-        // refund is an income category despite not ending in _income
-        assert_eq!(
-            svc.resolve_slug("refund", Direction::Income, 45.99)
-                .as_deref(),
-            Some("refund")
-        );
-        // income slug on expense tx → model error
-        assert!(svc
-            .resolve_slug("salary_income", Direction::Expense, -50.0)
-            .is_none());
-        assert!(svc
-            .resolve_slug("refund", Direction::Expense, -50.0)
-            .is_none());
-        assert!(svc.resolve_slug("nope", Direction::Expense, -1.0).is_none());
-        // amount == 0: either direction allowed
-        assert_eq!(
-            svc.resolve_slug("salary_income", Direction::Expense, 0.0)
-                .as_deref(),
-            Some("salary_income")
-        );
-        assert_eq!(
-            svc.resolve_slug("groceries", Direction::Income, 0.0)
-                .as_deref(),
-            Some("groceries")
+            default_expense_label("fr"),
+            "Other expenses",
+            "non-de falls back to en"
         );
     }
 
@@ -421,7 +285,7 @@ mod tests {
         cfg.ollama_url = "http://127.0.0.1:1".into(); // nothing listens
         cfg.request_timeout_secs = 1;
         cfg.max_retries = 0;
-        let svc = LabelService::new(&cfg, builtin());
+        let svc = LabelService::new(&cfg);
         let res = svc
             .label(vec![tx("a", -5.0, "X", "Y")], "de".into(), false)
             .await;

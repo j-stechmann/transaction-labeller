@@ -12,9 +12,7 @@ use transaction_labeller::pipeline::LabelService;
 
 async fn spawn_app(mock: &MockServer, cfg_overrides: &[(&str, &str)]) -> (String, Config) {
     let cfg = test_config(&mock.url(), cfg_overrides);
-    let taxonomy =
-        transaction_labeller::taxonomy::Taxonomy::load(cfg.taxonomy_path.as_deref()).unwrap();
-    let service = Arc::new(LabelService::new(&cfg, taxonomy));
+    let service = Arc::new(LabelService::new(&cfg));
     let app = transaction_labeller::router::build_router(Arc::clone(&service), cfg.max_batch);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -61,7 +59,7 @@ fn tx(id: &str, amount: f64, counterparty: &str, purpose: &str) -> Value {
 }
 
 #[tokio::test]
-async fn single_transaction_labelled_with_localized_label() {
+async fn single_transaction_labelled() {
     let b = MockBehaviour {
         keyword_map: default_keyword_map(),
         rationale: true,
@@ -83,17 +81,18 @@ async fn single_transaction_labelled_with_localized_label() {
     assert_eq!(status, 200, "body: {body}");
     let r = &body["results"][0];
     assert_eq!(r["id"], "tx1");
-    assert_eq!(r["category"], "groceries");
-    assert_eq!(r["category_label"], "Lebensmittel");
-    assert_eq!(r["direction"], "expense");
-    assert_eq!(r["status"], "ok");
-    assert_eq!(r["model"], "qwen3.5:4b");
+    assert_eq!(r["label"], "Lebensmittel");
     assert!(r["rationale"].is_string());
+    assert_eq!(r["model"], "qwen3.5:4b");
     assert!(body["batch_ms"].is_u64());
+    // Response contains ONLY the label (+id/rationale/model) — no category
+    // slug, no direction, no status fields.
+    let obj = r.as_object().unwrap();
+    assert_eq!(obj.len(), 4, "response must be minimal: {obj:?}");
 }
 
 #[tokio::test]
-async fn language_switch_changes_label_not_slug() {
+async fn language_switch_changes_label_language() {
     let b = MockBehaviour {
         keyword_map: default_keyword_map(),
         ..MockBehaviour::default()
@@ -101,20 +100,30 @@ async fn language_switch_changes_label_not_slug() {
     let m = spawn_with(b).await;
     let (url, _cfg) = spawn_app(&m, &[]).await;
 
-    let mk_body = |lang: &str| {
+    // Same merchant, different requested language: the prompt the mock sees
+    // is identical except nothing — the mock keys on the keyword. Use an
+    // en-keyword transaction for the en request so labels differ.
+    let (_, de) = post_json(
+        &url,
+        "/v1/label",
         json!({
             "transaction": tx("tx1", -42.13, "REWE", "Einkauf"),
-            "options": {"language": lang}
-        })
-    };
+            "options": {"language": "de"}
+        }),
+    )
+    .await;
+    let (_, en) = post_json(
+        &url,
+        "/v1/label",
+        json!({
+            "transaction": tx("tx2", -58.20, "WHOLE FOODS MARKET", "Groceries"),
+            "options": {"language": "en"}
+        }),
+    )
+    .await;
 
-    let (_, de) = post_json(&url, "/v1/label", mk_body("de")).await;
-    let (_, en) = post_json(&url, "/v1/label", mk_body("en")).await;
-
-    assert_eq!(de["results"][0]["category"], "groceries");
-    assert_eq!(en["results"][0]["category"], "groceries");
-    assert_eq!(de["results"][0]["category_label"], "Lebensmittel");
-    assert_eq!(en["results"][0]["category_label"], "Groceries");
+    assert_eq!(de["results"][0]["label"], "Lebensmittel");
+    assert_eq!(en["results"][0]["label"], "Groceries");
 }
 
 #[tokio::test]
@@ -151,7 +160,7 @@ async fn batch_labels_in_parallel_and_preserves_order() {
         };
         assert_eq!(r["id"], expected_id, "positional order must be preserved");
     }
-    assert_eq!(results[12]["category"], "salary_income");
+    assert_eq!(results[12]["label"], "Einkommen");
 
     // Parallelism: with 7 chunks, concurrency 4, delay 50ms →
     // sequential would be ≥ 350ms; parallel should be well under.
@@ -190,16 +199,16 @@ async fn concurrency_is_bounded_by_semaphore() {
 }
 
 #[tokio::test]
-async fn invalid_labels_fall_back_itemwise() {
+async fn empty_labels_fall_back_itemwise() {
     let b = MockBehaviour {
         keyword_map: default_keyword_map(),
-        invalid_labels: true,
+        empty_labels: true,
         ..MockBehaviour::default()
     };
     let m = spawn_with(b).await;
     let (url, _cfg) = spawn_app(&m, &[]).await;
 
-    // Primary call returns invalid label → individual retry → still invalid → fallback
+    // Primary call returns empty labels → individual retry → still empty → fallback
     let (status, body) = post_json(
         &url,
         "/v1/label:batch",
@@ -213,10 +222,8 @@ async fn invalid_labels_fall_back_itemwise() {
     );
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0]["status"], "fallback_unknown");
-    assert_eq!(results[0]["category"], "other_expense");
-    assert_eq!(results[1]["status"], "fallback_unknown");
-    assert_eq!(results[1]["category"], "other_income");
+    assert_eq!(results[0]["label"], "Sonstige Ausgaben");
+    assert_eq!(results[1]["label"], "Sonstige Einnahmen");
 }
 
 #[tokio::test]
@@ -237,8 +244,7 @@ async fn garbage_output_falls_back_itemwise() {
     .await;
 
     assert_eq!(status, 200, "body: {body}");
-    assert_eq!(body["results"][0]["status"], "fallback_unknown");
-    assert_eq!(body["results"][0]["category"], "other_expense");
+    assert_eq!(body["results"][0]["label"], "Sonstige Ausgaben");
 }
 
 #[tokio::test]
@@ -262,7 +268,7 @@ async fn transient_500_is_retried_then_succeeds() {
         status, 200,
         "retry after transient 500 must succeed: {body}"
     );
-    assert_eq!(body["results"][0]["category"], "groceries");
+    assert_eq!(body["results"][0]["label"], "Lebensmittel");
     assert!(
         m.chat_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
         "must have retried"
@@ -350,12 +356,8 @@ async fn validation_errors_return_uniform_error_body() {
 }
 
 #[tokio::test]
-async fn health_and_taxonomy_endpoints() {
-    let b = MockBehaviour {
-        keyword_map: default_keyword_map(),
-        ..MockBehaviour::default()
-    };
-    let m = spawn_with(b).await;
+async fn health_endpoint() {
+    let m = spawn_with(MockBehaviour::default()).await;
     let (url, _cfg) = spawn_app(&m, &[]).await;
 
     let client = reqwest::Client::new();
@@ -364,47 +366,13 @@ async fn health_and_taxonomy_endpoints() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["status"], "ok");
 
+    // taxonomy endpoint must be gone
     let res = client
-        .get(format!("{url}/v1/taxonomy?language=en"))
+        .get(format!("{url}/v1/taxonomy"))
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status().as_u16(), 200);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["language"], "en");
-    let cats = body["categories"].as_array().unwrap();
-    assert!(cats.len() >= 20);
-    assert!(
-        cats.iter()
-            .any(|c| c["slug"] == "groceries" && c["label"] == "Groceries"),
-        "taxonomy must expose slug + localized label"
-    );
-
-    // unknown 2-letter language: falls back to canonical (de) names per design
-    let res = client
-        .get(format!("{url}/v1/taxonomy?language=xx"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status().as_u16(), 200);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["language"], "xx");
-    assert!(
-        body["categories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["label"] == "Lebensmittel"),
-        "unknown language must fall back to canonical names"
-    );
-
-    // malformed language → 400
-    let res = client
-        .get(format!("{url}/v1/taxonomy?language=notalang"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status().as_u16(), 400);
+    assert_eq!(res.status().as_u16(), 404, "/v1/taxonomy must not exist");
 }
 
 #[tokio::test]
@@ -413,7 +381,7 @@ async fn openapi_docs_are_served() {
     let (url, _cfg) = spawn_app(&m, &[]).await;
     let client = reqwest::Client::new();
 
-    // OpenAPI JSON: valid, versioned, all 4 operations + key schemas present.
+    // OpenAPI JSON: valid, versioned, all operations + key schemas present.
     let res = client
         .get(format!("{url}/api-docs/openapi.json"))
         .send()
@@ -428,13 +396,16 @@ async fn openapi_docs_are_served() {
     assert_eq!(spec["info"]["title"], "transaction-labeller");
 
     let paths = spec["paths"].as_object().unwrap();
-    for p in ["/v1/label", "/v1/label:batch", "/v1/health", "/v1/taxonomy"] {
+    for p in ["/v1/label", "/v1/label:batch", "/v1/health"] {
         assert!(paths.contains_key(p), "spec missing path {p}");
     }
+    assert!(
+        !paths.contains_key("/v1/taxonomy"),
+        "taxonomy endpoint removed"
+    );
     assert!(paths["/v1/label"]["post"].is_object());
     assert!(paths["/v1/label:batch"]["post"].is_object());
     assert!(paths["/v1/health"]["get"].is_object());
-    assert!(paths["/v1/taxonomy"]["get"].is_object());
 
     let schemas = spec["components"]["schemas"].as_object().unwrap();
     for s in [
@@ -446,18 +417,15 @@ async fn openapi_docs_are_served() {
         "BatchResponse",
         "ApiError",
         "HealthResponse",
-        "TaxonomyResponse",
-        "Direction",
-        "ItemStatus",
     ] {
         assert!(schemas.contains_key(s), "spec missing schema {s}");
     }
 
-    // LabelResult schema carries the field semantics docs.
-    let lr = &schemas["LabelResult"];
-    assert!(lr["properties"]["category"].is_object());
-    assert!(lr["properties"]["category_label"].is_object());
-    assert!(lr["properties"]["status"].is_object());
+    // LabelResult must be minimal: id, label, rationale, model.
+    let props = schemas["LabelResult"]["properties"].as_object().unwrap();
+    let keys: Vec<_> = props.keys().collect();
+    assert_eq!(keys.len(), 4, "LabelResult must be minimal: {keys:?}");
+    assert!(props.contains_key("label"));
 
     // Swagger UI HTML is served and references the spec.
     let res = client
@@ -480,9 +448,7 @@ async fn unreachable_backend_returns_503_with_retry_after() {
         request_timeout_secs: 2,
         ..cfg
     };
-    let taxonomy =
-        transaction_labeller::taxonomy::Taxonomy::load(cfg.taxonomy_path.as_deref()).unwrap();
-    let service = Arc::new(LabelService::new(&cfg, taxonomy));
+    let service = Arc::new(LabelService::new(&cfg));
     let app = transaction_labeller::router::build_router(service, cfg.max_batch);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

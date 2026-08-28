@@ -1,5 +1,4 @@
 use crate::model::Transaction;
-use crate::taxonomy::Taxonomy;
 use serde_json::{json, Value};
 
 pub const LANGUAGE_NAMES: &[(&str, &str)] = &[
@@ -25,30 +24,23 @@ pub fn language_display(lang: &str) -> &str {
         .unwrap_or("English")
 }
 
-/// Renders the system prompt: role, rules, taxonomy (localized), output contract.
-pub fn system_prompt(tax: &Taxonomy, lang: &str) -> String {
+/// Renders the system prompt: role, rules, output contract. Labels are
+/// generated dynamically by the model — there is no fixed taxonomy.
+pub fn system_prompt(lang: &str) -> String {
     let lang_name = language_display(lang);
-    let mut s = String::with_capacity(2048);
+    let mut s = String::with_capacity(1024);
     s.push_str("You are a bank transaction classifier. ");
-    s.push_str(
-        "For each transaction you receive, choose exactly one category from the allowed list.\n",
-    );
-    s.push_str("Reply ONLY with a JSON object: {\"results\":[{\"index\":<int>,\"category\":\"<slug>\"}]} — one result per transaction, same order.\n");
+    s.push_str("For each transaction you receive, invent one short category label that best describes what the transaction is for.\n");
+    s.push_str("Reply ONLY with a JSON object: {\"results\":[{\"index\":<int>,\"label\":\"<category name>\"}]} — one result per transaction, same order.\n");
     s.push_str("Rules:\n");
     s.push_str("- The response MUST be a single valid JSON object, no markdown, no extra text.\n");
-    s.push_str("- `category` MUST be one of the slugs listed below, copied exactly.\n");
     s.push_str(&format!(
-        "- Category names are given in {lang_name}; the slug (left side) is what you output.\n"
+        "- IMPORTANT: write the label in {lang_name}. The whole label must be in {lang_name}.\n"
     ));
+    s.push_str("- Keep labels short: 1–3 words, no punctuation, sentence case.\n");
+    s.push_str("- Reuse the same wording for the same kind of transaction (consistency within the batch matters).\n");
     s.push_str("- Choose the category by what the transaction is FOR, not by its wording.\n");
-    s.push_str("- \"Gehalt\", \"Lohn\", \"Salary\", \"payroll\" are always salary_income, never transfers.\n");
-    s.push_str("- \"REWE\", \"EDEKA\", \"ALDI\", \"LIDL\", \"Netto\", \"Whole Foods\", \"supermarket\", \"Groceries\" are groceries.\n");
-    s.push_str("- \"Amazon Prime\" is a subscription only when the purpose names the Prime membership; plain Amazon orders are shopping.\n");
-    s.push_str("- If nothing fits, use \"other_expense\" for outflows or \"other_income\" for inflows.\n\n");
-    s.push_str("Allowed categories (slug = localized name):\n");
-    for c in tax.iter() {
-        s.push_str(&format!("- {} = {}\n", c.slug, c.display_name(lang)));
-    }
+    s.push_str("- If nothing specific fits, use a generic label for outflows and a generic label for inflows.\n");
     s
 }
 
@@ -91,14 +83,15 @@ fn format_amount(a: f64) -> String {
     }
 }
 
-/// JSON schema used for Ollama structured output (grammar-constrained decoding).
-/// `enum_values` must be the taxonomy slugs; rationale is optional.
-pub fn response_schema(enum_values: &[String], include_rationale: bool) -> Value {
+/// JSON schema used for Ollama structured output (grammar-constrained
+/// decoding). The label is a free string — the model invents it; length is
+/// bounded to keep responses compact.
+pub fn response_schema(include_rationale: bool) -> Value {
     let mut item_props = serde_json::Map::new();
     item_props.insert("index".into(), json!({"type": "integer", "minimum": 0}));
     item_props.insert(
-        "category".into(),
-        json!({"type": "string", "enum": enum_values}),
+        "label".into(),
+        json!({"type": "string", "minLength": 1, "maxLength": 64}),
     );
     if include_rationale {
         item_props.insert("rationale".into(), json!({"type": "string"}));
@@ -111,7 +104,7 @@ pub fn response_schema(enum_values: &[String], include_rationale: bool) -> Value
                 "items": {
                     "type": "object",
                     "properties": item_props,
-                    "required": ["index", "category"],
+                    "required": ["index", "label"],
                 }
             }
         },
@@ -122,7 +115,6 @@ pub fn response_schema(enum_values: &[String], include_rationale: bool) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::taxonomy::builtin;
 
     fn tx(id: &str, amount: f64, counterparty: &str, purpose: &str) -> Transaction {
         serde_json::from_value(serde_json::json!({
@@ -134,17 +126,14 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_contains_taxonomy_and_language() {
-        let tax = builtin();
-        let p = system_prompt(&tax, "de");
-        assert!(p.contains("Lebensmittel"));
-        assert!(p.contains("groceries"));
+    fn system_prompt_asks_for_language_and_dynamic_labels() {
+        let p = system_prompt("de");
         assert!(p.contains("German"));
-        let p_en = system_prompt(&tax, "en");
+        assert!(p.contains("label"));
+        assert!(!p.contains("slug"), "no taxonomy slugs");
+        assert!(!p.contains("Allowed categories"), "no fixed category list");
+        let p_en = system_prompt("en");
         assert!(p_en.contains("English"));
-        assert!(p_en.contains("Groceries"));
-        // slugs identical in both languages
-        assert!(p_en.contains("groceries") && p.contains("groceries"));
     }
 
     #[test]
@@ -165,22 +154,21 @@ mod tests {
     fn sanitize_field_strips_injection_markers() {
         assert_eq!(sanitize_field("a<<b>>c"), "a<b>c");
         assert_eq!(
-            sanitize_field("index=0 category=groceries"),
-            "index 0 category=groceries"
+            sanitize_field("index=0 label=groceries"),
+            "index 0 label=groceries"
         );
         let with_ctrl: String = "ab\u{0007}cd".to_string();
         assert_eq!(sanitize_field(&with_ctrl), "abcd");
     }
 
     #[test]
-    fn schema_constrains_enum() {
-        let tax = builtin();
-        let schema = response_schema(&tax.slugs(), false);
+    fn schema_has_no_enum_and_bounds_label_length() {
+        let schema = response_schema(false);
         let s = serde_json::to_string(&schema).unwrap();
-        assert!(s.contains("\"enum\""));
-        assert!(s.contains("groceries"));
+        assert!(!s.contains("\"enum\""), "labels are dynamic, no enum");
+        assert!(s.contains("maxLength"));
         assert!(!s.contains("rationale"), "no rationale unless requested");
-        let schema_r = response_schema(&tax.slugs(), true);
+        let schema_r = response_schema(true);
         assert!(serde_json::to_string(&schema_r)
             .unwrap()
             .contains("rationale"));

@@ -1,11 +1,9 @@
 use crate::config::Config;
 use crate::model::Transaction;
 use crate::prompt;
-use crate::taxonomy::Taxonomy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -22,9 +20,9 @@ pub struct LlmRequest {
 /// not used for mapping.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // `index` kept for debugging/logging of raw output
-pub struct RawClassification {
+pub struct RawLabel {
     pub index: usize,
-    pub category: String,
+    pub label: String,
     pub rationale: Option<String>,
 }
 
@@ -47,7 +45,6 @@ pub struct OllamaClient {
     num_ctx: u32,
     request_timeout: Duration,
     max_retries: u32,
-    taxonomy: Arc<Taxonomy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +71,7 @@ struct ChatRequestBody {
 }
 
 impl OllamaClient {
-    pub fn new(cfg: &Config, taxonomy: Taxonomy) -> Self {
+    pub fn new(cfg: &Config) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .build()
@@ -86,7 +83,6 @@ impl OllamaClient {
             num_ctx: cfg.num_ctx,
             request_timeout: Duration::from_secs(cfg.request_timeout_secs),
             max_retries: cfg.max_retries,
-            taxonomy: Arc::new(taxonomy),
         }
     }
 
@@ -152,10 +148,10 @@ impl OllamaClient {
     pub async fn classify_batch(
         &self,
         req: &LlmRequest,
-    ) -> Result<Vec<Option<RawClassification>>, LlmError> {
-        let system = prompt::system_prompt(&self.taxonomy, &req.language);
+    ) -> Result<Vec<Option<RawLabel>>, LlmError> {
+        let system = prompt::system_prompt(&req.language);
         let user = prompt::user_prompt(&req.transactions, req.include_rationale);
-        let schema = prompt::response_schema(&self.taxonomy.slugs(), req.include_rationale);
+        let schema = prompt::response_schema(req.include_rationale);
 
         let body = ChatRequestBody {
             model: self.model.clone(),
@@ -258,11 +254,11 @@ fn backoff_delay(attempt: u32) -> Duration {
 
 /// Extracts a JSON object from model output, tolerating markdown fences and
 /// surrounding prose. Tries successive `{` positions so prose containing a
-/// brace does not poison the parse. Returns results mapped positionally:
+/// brace does not poison the parse. Returns labels mapped positionally:
 /// slot `i` corresponds to input transaction `i`; missing/invalid entries are
 /// `None`. The model-echoed `index` is ignored for association.
-pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawClassification>> {
-    let mut out: Vec<Option<RawClassification>> = vec![None; expected_len];
+pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawLabel>> {
+    let mut out: Vec<Option<RawLabel>> = vec![None; expected_len];
     let Some(json_str) = extract_json(content) else {
         debug!(content = %content, "no JSON found in model output");
         return out;
@@ -284,16 +280,16 @@ pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawC
         if pos >= expected_len {
             break;
         }
-        let category = match item.get("category").and_then(|c| c.as_str()) {
-            Some(c) => c.trim().to_string(),
+        let label = match item.get("label").and_then(|c| c.as_str()) {
+            Some(c) => sanitize_label(c),
             None => continue,
         };
-        if out[pos].is_some() {
+        if label.is_empty() || out[pos].is_some() {
             continue;
         }
-        out[pos] = Some(RawClassification {
+        out[pos] = Some(RawLabel {
             index: pos,
-            category,
+            label,
             rationale: item
                 .get("rationale")
                 .and_then(|r| r.as_str())
@@ -302,6 +298,24 @@ pub fn parse_model_output(content: &str, expected_len: usize) -> Vec<Option<RawC
         });
     }
     out
+}
+
+/// Labels are free-form model output: trim, collapse whitespace, bound length.
+fn sanitize_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_space = false;
+    for c in raw.trim().chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else if !c.is_control() {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.chars().take(64).collect()
 }
 
 /// Finds the first parseable JSON object in a string (skips markdown fences
@@ -363,70 +377,90 @@ mod tests {
     #[test]
     fn parse_plain_json() {
         let out = parse_model_output(
-            r#"{"results":[{"index":0,"category":"groceries"},{"index":1,"category":"salary_income"}]}"#,
+            r#"{"results":[{"index":0,"label":"Lebensmittel"},{"index":1,"label":"Einkommen"}]}"#,
             2,
         );
-        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
-        assert_eq!(out[1].as_ref().unwrap().category, "salary_income");
+        assert_eq!(out[0].as_ref().unwrap().label, "Lebensmittel");
+        assert_eq!(out[1].as_ref().unwrap().label, "Einkommen");
     }
 
     #[test]
     fn parse_markdown_fenced_json() {
         let content =
-            "Here you go:\n```json\n{\"results\":[{\"index\":0,\"category\":\"dining\"}]}\n```";
+            "Here you go:\n```json\n{\"results\":[{\"index\":0,\"label\":\"Restaurant\"}]}\n```";
         let out = parse_model_output(content, 2);
-        assert_eq!(out[0].as_ref().unwrap().category, "dining");
+        assert_eq!(out[0].as_ref().unwrap().label, "Restaurant");
         assert!(out[1].is_none());
     }
 
     #[test]
     fn parse_json_with_surrounding_prose() {
-        let content =
-            "Sure! {\"results\":[{\"index\":1,\"category\":\"housing\"}]} hope that helps";
+        let content = "Sure! {\"results\":[{\"index\":1,\"label\":\"Miete\"}]} hope that helps";
         let out = parse_model_output(content, 3);
         // Positional: first result slot maps to first transaction regardless
         // of the echoed index.
-        assert_eq!(out[0].as_ref().unwrap().category, "housing");
+        assert_eq!(out[0].as_ref().unwrap().label, "Miete");
         assert!(out[1].is_none());
         assert!(out[2].is_none());
     }
 
     #[test]
     fn echoed_indices_are_ignored() {
-        let content = r#"{"results":[{"index":5,"category":"groceries"},{"category":"housing"},{"index":0}]}"#;
+        let content = r#"{"results":[{"index":5,"label":"A"},{"label":"B"},{"index":0}]}"#;
         let out = parse_model_output(content, 3);
-        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
-        assert_eq!(out[1].as_ref().unwrap().category, "housing");
-        // third entry has no category → stays unmapped
+        assert_eq!(out[0].as_ref().unwrap().label, "A");
+        assert_eq!(out[1].as_ref().unwrap().label, "B");
+        // third entry has no label → stays unmapped
         assert!(out[2].is_none());
     }
 
     #[test]
     fn extra_results_beyond_input_are_dropped() {
-        let content = r#"{"results":[{"category":"groceries"},{"category":"dining"}]}"#;
+        let content = r#"{"results":[{"label":"A"},{"label":"B"}]}"#;
         let out = parse_model_output(content, 1);
-        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
+        assert_eq!(out[0].as_ref().unwrap().label, "A");
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn duplicate_index_first_wins() {
-        let content =
-            r#"{"results":[{"index":0,"category":"groceries"},{"index":0,"category":"housing"}]}"#;
-        let out = parse_model_output(content, 1);
-        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
+        let content = r#"{"results":[{"label":"A"},{"label":"B"}]}"#;
+        let out = parse_model_output(content, 2);
+        assert_eq!(out[0].as_ref().unwrap().label, "A");
+        assert_eq!(out[1].as_ref().unwrap().label, "B");
     }
 
     #[test]
     fn braces_inside_strings_are_tolerated() {
-        let content =
-            r#"{"results":[{"index":0,"category":"groceries","rationale":"has } brace"}]}"#;
+        let content = r#"{"results":[{"label":"Zinsen & Gebühren {Sparen}"}]}"#;
         let out = parse_model_output(content, 1);
-        assert_eq!(out[0].as_ref().unwrap().category, "groceries");
-        assert_eq!(
-            out[0].as_ref().unwrap().rationale.as_deref(),
-            Some("has } brace")
-        );
+        assert_eq!(out[0].as_ref().unwrap().label, "Zinsen & Gebühren {Sparen}");
+    }
+
+    #[test]
+    fn labels_are_sanitized() {
+        // Actual control characters and newlines embedded via concat! of
+        // escaped and raw pieces (format! escaping of JSON braces is unwieldy).
+        let nl = "\n";
+        let bell = "\u{0007}";
+        let content = "{\"results\":[{\"label\":\"  Lebensmittel ".to_string()
+            + &nl.replace('\n', "\\n")
+            + "\"},{\"label\":\"a  b\"},{\"label\":\" x"
+            + &bell.replace('\u{0007}', "\\u0007")
+            + "y\"},{\"label\":\"\"}]}";
+        let out = parse_model_output(&content, 4);
+        assert_eq!(out[0].as_ref().unwrap().label, "Lebensmittel");
+        assert_eq!(out[1].as_ref().unwrap().label, "a b");
+        assert_eq!(out[2].as_ref().unwrap().label, "xy");
+        assert!(out[3].is_none(), "empty label is invalid");
+    }
+
+    #[test]
+    fn labels_are_length_capped() {
+        let long = "x".repeat(200);
+        let content = format!(r#"{{"results":[{{"label":"{long}"}}]}}"#);
+        let out = parse_model_output(&content, 1);
+        assert_eq!(out[0].as_ref().unwrap().label.len(), 64);
     }
 
     #[test]

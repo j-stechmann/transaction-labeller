@@ -1,23 +1,26 @@
 //! Golden result tests (correctness of results through the pipeline).
 //!
 //! The golden set (`tests/golden/cases.json`) contains real-world-style
-//! transactions with expected canonical categories. Two modes:
+//! transactions with expected labels (in the requested language). Two modes:
 //!
 //! 1. **Deterministic mode (default, `cargo test`)**: runs the golden set
 //!    through the full pipeline against the keyword-mapping mock LLM. This
-//!    verifies the prompt → validation → mapping path preserves the contract
-//!    (positional order, direction checks, localized labels).
-//! 2. **Live eval (`cargo test -- --ignored live_eval`)**: same set against a
-//!    real Ollama model with temperature 0; asserts macro accuracy ≥ 0.8 and
-//!    reports per-category recall + confusion pairs. Requires a running
-//!    Ollama with the model pulled; skipped by default so CI needs no GPU.
+//!    verifies the prompt → parsing → mapping path preserves the contract
+//!    (positional order, localized labels, minimal response shape).
+//! 2. **Live eval (`cargo test -- --ignored live_eval`)**: the full set is
+//!    labelled in ONE request against a real Ollama model at temperature 0
+//!    (single batch is required: with dynamic labels the model keeps wording
+//!    consistent within a batch, but wording shifts across batch
+//!    compositions). Expected labels are *semantic sets* — any label in the
+//!    set counts as correct, because free-form wording varies (e.g.
+//!    `Miete` ≈ `Mietzahlung` ≈ `Wohnen`). Requires a running Ollama with the
+//!    model pulled; skipped by default so CI needs no GPU.
 
 mod mock_llm;
 
 use mock_llm::{default_keyword_map, spawn_with, MockBehaviour};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use transaction_labeller::config::Config;
 use transaction_labeller::pipeline::LabelService;
@@ -31,11 +34,22 @@ struct GoldenCase {
 
 #[derive(Debug, Deserialize)]
 struct GoldenExpectation {
-    category: String,
-    direction: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    zero_amount: bool,
+    /// Any of these labels (normalized comparison) counts as correct.
+    /// First entry is used as the display expectation.
+    label: Value,
+}
+
+impl GoldenExpectation {
+    fn labels(&self) -> Vec<String> {
+        match &self.label {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => panic!("expected.label must be a string or array of strings"),
+        }
+    }
 }
 
 fn load_golden() -> Vec<GoldenCase> {
@@ -46,15 +60,15 @@ fn load_golden() -> Vec<GoldenCase> {
 async fn run_through_pipeline(
     cases: &[GoldenCase],
     ollama_url: &str,
+    micro_batch: usize,
 ) -> Vec<(String, Value, GoldenExpectation)> {
     let cfg = Config {
         ollama_url: ollama_url.to_string(),
-        micro_batch: 4,
-        concurrency: 2,
+        micro_batch,
+        concurrency: 1,
         ..Config::default()
     };
-    let taxonomy = transaction_labeller::taxonomy::Taxonomy::load(None).unwrap();
-    let service = Arc::new(LabelService::new(&cfg, taxonomy));
+    let service = Arc::new(LabelService::new(&cfg));
 
     let transactions: Vec<transaction_labeller::model::Transaction> = cases
         .iter()
@@ -64,7 +78,7 @@ async fn run_through_pipeline(
     let batch = service
         .label(transactions, "de".to_string(), false)
         .await
-        .expect("mock backend works");
+        .expect("backend works");
 
     cases
         .iter()
@@ -79,103 +93,107 @@ async fn run_through_pipeline(
 }
 
 /// Deterministic mode: pipeline correctness against the contract mock.
+/// The mock's keyword map is the deterministic ground truth for this set;
+/// any cross-item mis-mapping, ordering bug, or parsing regression fails here.
 #[tokio::test]
-async fn golden_pipeline_preserves_contract() {
+async fn golden_pipeline_maps_positions_exactly() {
     let b = MockBehaviour {
         keyword_map: default_keyword_map(),
         ..MockBehaviour::default()
     };
     let m = spawn_with(b).await;
     let cases = load_golden();
-    let results = run_through_pipeline(&cases, &m.url()).await;
-    let taxonomy = transaction_labeller::taxonomy::builtin();
+    let results = run_through_pipeline(&cases, &m.url(), 4).await;
 
     for (name, result, expected) in &results {
+        let case = cases.iter().find(|c| &c.name == name).unwrap();
+        let expected_id = case.transaction["id"].as_str().unwrap();
+        let expected_label = expected.labels()[0].clone();
         assert_eq!(
-            result["direction"], expected.direction,
-            "case {name}: direction mismatch"
+            result["label"], expected_label,
+            "case {name}: label mismatch (positional association broken?)"
         );
-        // Exact category match: the mock's keyword map is the deterministic
-        // ground truth for this set. Any cross-item mis-mapping, ordering
-        // bug, or validation regression fails here.
-        assert_eq!(
-            result["category"], expected.category,
-            "case {name}: category mismatch (positional association broken?)"
-        );
-        let slug = result["category"].as_str().unwrap();
-        let cat = taxonomy
-            .lookup(slug)
-            .unwrap_or_else(|| panic!("case {name}: slug {slug} must exist in taxonomy"));
-        assert_eq!(
-            cat.direction.to_string(),
-            expected.direction,
-            "case {name}: slug {slug} direction inconsistent"
-        );
-        assert_eq!(result["status"], "ok", "case {name}: must not fall back");
+        assert_eq!(result["id"], expected_id, "case {name}: id mismatch");
         assert!(
-            result["category_label"].is_string(),
-            "case {name}: localized label required"
+            result["rationale"].is_null(),
+            "case {name}: rationale must be absent unless requested"
+        );
+        // Minimal response shape: id, label, model (no rationale).
+        let obj = result.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            3,
+            "case {name}: response must be minimal: {obj:?}"
         );
     }
 }
 
 /// Live eval against the real model. Run with:
 /// `cargo test -- --ignored live_eval --nocapture`
+///
+/// The whole golden set goes through in one request (`micro_batch = 32`) so
+/// the model applies its wording consistently. Each case lists semantically
+/// acceptable labels; a produced label is correct if it matches any of them
+/// (case/punctuation-insensitive). This checks that labels are *sensible and
+/// on-topic*, not verbatim wording — wording is the model's choice.
 #[tokio::test]
 #[ignore = "requires running Ollama with the model pulled (GPU)"]
 async fn live_eval() {
     let ollama_url =
         std::env::var("TL_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let cases = load_golden();
-    let results = run_through_pipeline(&cases, &ollama_url).await;
+    let results = run_through_pipeline(&cases, &ollama_url, 32).await;
 
     let mut correct = 0usize;
-    let mut per_category: HashMap<String, (usize, usize)> = HashMap::new(); // (correct, total)
-    let mut confusions: Vec<(String, String)> = Vec::new();
+    let mut wrong: Vec<(String, Vec<String>, String)> = Vec::new();
 
-    eprintln!("\n{:<28} {:<22} {:<22}", "case", "expected", "actual");
+    eprintln!("\n{:<28} {:<32} {:<28}", "case", "acceptable", "actual");
     for (name, result, expected) in &results {
-        let actual = result["category"].as_str().unwrap_or("<none>");
-        let ok = actual == expected.category;
+        let actual = result["label"].as_str().unwrap_or("<none>");
+        let acceptable = expected.labels();
+        let ok = acceptable.iter().any(|e| labels_match(actual, e));
         if ok {
             correct += 1;
         } else {
-            confusions.push((expected.category.clone(), actual.to_string()));
-        }
-        let entry = per_category
-            .entry(expected.category.clone())
-            .or_insert((0, 0));
-        entry.1 += 1;
-        if ok {
-            entry.0 += 1;
+            wrong.push((name.clone(), acceptable.clone(), actual.to_string()));
         }
         eprintln!(
-            "{:<28} {:<22} {:<22} {}",
+            "{:<28} {:<32} {:<28} {}",
             name,
-            expected.category,
+            acceptable.join(" / "),
             actual,
-            if ok { "✓" } else { "✗" }
+            if ok { "ok" } else { "MISMATCH" }
         );
     }
 
     let n = results.len();
     let accuracy = correct as f64 / n as f64;
-    eprintln!("\nmacro accuracy: {correct}/{n} = {accuracy:.2}");
+    eprintln!("\nlabel accuracy: {correct}/{n} = {accuracy:.2}");
 
-    eprintln!("\nper-category recall:");
-    for (cat, (c, t)) in &per_category {
-        eprintln!("  {cat:<28} {c}/{t}");
-    }
-    if !confusions.is_empty() {
-        eprintln!("\nconfusions (expected → actual):");
-        for (e, a) in &confusions {
-            eprintln!("  {e} → {a}");
+    if !wrong.is_empty() {
+        eprintln!("\nmismatches (case, acceptable → actual):");
+        for (n, e, a) in &wrong {
+            eprintln!("  {n}: {:?} → {:?}", e.first(), a);
         }
     }
 
-    // Minimum quality bar (see docs/design.md §Testing).
+    // Quality bar: labels are free-form; the acceptable-set covers reasonable
+    // wording. Below this threshold the model is mislabelling, not rewording.
     assert!(
         accuracy >= 0.8,
-        "live eval macro accuracy {accuracy:.2} below 0.8 threshold"
+        "live eval label accuracy {accuracy:.2} below 0.8 threshold"
     );
+}
+
+/// Compares a produced label against an acceptable one, tolerating case,
+/// trailing punctuation and hyphen/space differences (dynamic labels are
+/// free-form; German compound variants are covered by the acceptable set).
+fn labels_match(actual: &str, expected: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .to_lowercase()
+            .trim_end_matches(['.', '!', '?'])
+            .replace('-', " ")
+    };
+    norm(actual) == norm(expected)
 }

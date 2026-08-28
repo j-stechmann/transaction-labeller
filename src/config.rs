@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -10,7 +8,6 @@ pub struct Config {
     pub micro_batch: usize,
     pub num_ctx: u32,
     pub vram_budget_mb: u64,
-    pub taxonomy_path: Option<PathBuf>,
     pub request_timeout_secs: u64,
     pub max_retries: u32,
     pub max_batch: usize,
@@ -27,7 +24,6 @@ impl Default for Config {
             micro_batch: 8,
             num_ctx: 8192,
             vram_budget_mb: 8192,
-            taxonomy_path: None,
             request_timeout_secs: 30,
             max_retries: 2,
             max_batch: 100,
@@ -100,17 +96,6 @@ impl Config {
         if let Ok(v) = std::env::var("TL_MAX_BATCH") {
             cfg.max_batch = parse_usize("TL_MAX_BATCH", &v, Some(1), Some(10_000))?;
         }
-        if let Ok(v) = std::env::var("TL_TAXONOMY") {
-            let p = PathBuf::from(v.trim());
-            if !p.is_file() {
-                return Err(ConfigError::InvalidValue(format!(
-                    "TL_TAXONOMY path does not exist or is not a file: {}",
-                    p.display()
-                )));
-            }
-            cfg.taxonomy_path = Some(p);
-        }
-
         if cfg.language.len() != 2 || !cfg.language.chars().all(|c| c.is_ascii_alphabetic()) {
             return Err(ConfigError::InvalidValue(format!(
                 "TL_LANGUAGE must be a 2-letter ISO 639-1 code, got: {}",

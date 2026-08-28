@@ -8,7 +8,6 @@ mod model;
 mod pipeline;
 mod prompt;
 mod router;
-mod taxonomy;
 
 #[tokio::main]
 async fn main() {
@@ -27,15 +26,7 @@ async fn main() {
         }
     };
 
-    let taxonomy = match taxonomy::Taxonomy::load(cfg.taxonomy_path.as_deref()) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("{e}");
-            std::process::exit(2);
-        }
-    };
     info!(
-        categories = taxonomy.len(),
         language = %cfg.language,
         model = %cfg.model,
         ollama = %cfg.ollama_url,
@@ -54,7 +45,7 @@ async fn main() {
         warn!("binding to a non-loopback address: this service has no authentication");
     }
 
-    let service = Arc::new(pipeline::LabelService::new(&cfg, taxonomy));
+    let service = Arc::new(pipeline::LabelService::new(&cfg));
     let app = router::build_router(Arc::clone(&service), cfg.max_batch);
 
     // Advisory VRAM budget check against the running Ollama instance.

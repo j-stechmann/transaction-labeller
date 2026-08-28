@@ -1,99 +1,74 @@
 # Design: Transaction Labeller
 
-A Rust REST service that classifies bank transactions into spending/income categories
-using a locally-served LLM. No cloud inference.
+A Rust REST service that labels bank transactions with **category names
+generated dynamically by an LLM**, served locally via Ollama. The client
+receives **only the label** — no fixed taxonomy, no slugs, no database.
+8 GB VRAM budget on an RTX 3070 Ti; no cloud inference.
 
 ## Goals
 
-- Label transactions (income vs. spending categories) via REST API
-- Configurable label language (e.g. `de`, `en`)
-- Constrained decoding: the model may only choose from a fixed taxonomy
-- Parallelism: concurrent LLM requests, batched into a few prompts
-- 8 GB VRAM budget on an RTX 3070 Ti; model runs via Ollama
+- Label transactions with a short category name in a configurable language
+- Response contains nothing but the label (+ id, optional rationale, model)
+- Parallel processing with bounded concurrency
+- Local inference within 8 GB VRAM
 
 ## Non-goals
 
+- Fixed taxonomies / label registries (labels are the LLM's choice)
 - Training/fine-tuning
 - Bank-statement CSV parsing (input is structured JSON transactions)
 - Persistent storage of results
 
 ## Model selection (research summary)
 
-Candidate classes, all runnable on 8 GB VRAM with Q4 quantization:
+Decision and full comparison in ADR-001. Default: **`qwen3.5:4b`**
+(Ollama, Q4_K_M, ~3.4 GB, Apache-2.0). Key facts:
 
-| Model | VRAM (Q4) | Multilingual | IFEval | Structured output | Notes |
-|---|---|---|---|---|---|
-| **Qwen3.5-4B (default Q4)** | 3.4 GB | 201 languages | 89.8 | 89.06 (ExtractBench short) | Strongest in-class multilingual+IF; hybrid GDN+MoE |
-| Qwen3.5-2B | 1.9 GB | 201 languages | 89.8* | — | Same gen, weaker |
-| gemma4:12b QAT | 7.2 GB | 140+ | high | good | Too tight for KV headroom in 8 GB |
-| gemma4:e2b-it-qat | 4.3 GB | 140+ | high | good | Strong alternative, vision-capable |
-| Llama-3.2-3B | 2.0 GB | 8 langs | 77.7 | weak | Insufficient German |
-| Mistral-7B-v0.3 | 4.4 GB | ~7 | 58 | weak | Insufficient German |
-
-*\* 2B shares the 4B recipe per Qwen model card.*
-
-**Decision: default model `qwen3.5:4b` (Ollama tag), Q4_K_M, ~3.4 GB.**
-
-Rationale:
-1. **VRAM budget:** ~3.4 GB leaves >4.5 GB for KV cache, concurrency, and OS overhead —
-   comfortable within 8 GB even with several parallel requests.
-2. **Multilingual:** 201 languages (incl. German); MMMLU 76.1, INCLUDE 71.0, MAXIFE 78.0 —
-   the best multilingual instruction-following in its class by a clear margin.
-3. **Instruction following:** IFEval 89.8 (beats 9B-class GPT-OSS-20B at 88.2).
-   Structured-extraction eval: 89.06 on ExtractBench-short.
-4. **Constrained decoding:** Ollama supports JSON schema `format`; the Qwen3.5 chat
-   template is well supported.
-5. **License:** Apache-2.0 — no redistribution restriction.
-6. **Fallback headroom:** `qwen3.5:9b` (6.6 GB) fits 8 GB only with tight KV budget —
-   supported via config, not default.
-
-Rejection of gemma4:12b: 7.6 GB weights leave no KV/concurrency headroom in 8 GB.
+- 201 languages (incl. German — the primary data is a German bank export)
+- IFEval 89.8 (instruction following), strong structured-output accuracy
+- ~3.4 GB weights → >4.5 GB headroom for KV cache + concurrency on 8 GB
+- Must be called with `think: false` (thinking mode exhausts `num_predict`
+  before emitting content — discovered via live eval)
 
 ## Architecture
 
 ```
                     ┌─────────────────────────────────────────┐
-Client ──HTTP──▶    │ axum server (REST, /v1/…)               │
+Client ──HTTP──▶    │ axum server (REST, /v1/…, Swagger UI)   │
                     │   ├── POST /v1/label  (single tx)       │
                     │   ├── POST /v1/label:batch (parallel)   │
-                    │   └── GET  /v1/health, /v1/taxonomy     │
+                    │   └── GET  /v1/health                   │
                     └───────────────┬─────────────────────────┘
-                                    │
                           ┌─────────▼──────────┐
                           │ LabelService        │
-                          │ (core pipeline)     │
                           └─────────┬──────────┘
                     ┌───────────────┼────────────────┐
-                    │               │                │
               ┌─────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐
-              │ Prompt     │  │ LLM client  │  │ Validator   │
-              │ builder    │  │ (Ollama,    │  │ (taxonomy   │
-              │ (taxonomy, │  │  JSON schema│  │  match,     │
-              │  language) │  │  format)    │  │  fallback)  │
+              │ Prompt     │  │ LLM client  │  │ Label       │
+              │ builder    │  │ (Ollama,    │  │ sanitizer + │
+              │ (language, │  │  JSON schema│  │ retry +     │
+              │  rules)    │  │  format)    │  │ fallback    │
               └────────────┘  └─────────────┘  └─────────────┘
 ```
 
-- **REST layer** (axum): JSON in/out. Batching endpoint fans out N transactions to a
-  semaphore-bounded pool of concurrent LLM calls (default 4), each call covering a
-  micro-batch (default 8 transactions per prompt).
-- **Prompt builder**: renders system prompt with taxonomy + target label language +
-  disambiguation rules; per-request user prompt with the micro-batch's transactions.
-  Transaction fields are embedded in a structured block with field delimiters and
-  control-character stripping (cheap prompt-injection mitigation; residual risk is
-  mislabelling only, since the taxonomy is grammar-constrained).
-- **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>` for
-  grammar-constrained decoding. `options.num_ctx` is set explicitly (default 8192)
-  and `num_predict` capped (default 768) — Ollama's small default context would
-  otherwise silently truncate the taxonomy prompt. Retries: 2 attempts
-  (3 total) with exponential backoff (200 ms ×4, jitter), connect timeout 3 s,
-  total timeout 30 s per attempt; `keep_alive: "10m"` avoids model unload between
-  calls. On 503 the API responds with `Retry-After: 5`.
-- **Validator**: parses JSON response; results are mapped to transactions **by
-  position in the response array** (the model may echo ids, but ids are never
-  trusted for association); verifies each label ∈ taxonomy enum (canonical ASCII
-  slugs, case-insensitive); invalid/missing entries are retried once individually,
-  then fall back to `other_expense`/`other_income` with `status: fallback_unknown`
-  (ADR-004).
+- **Prompt builder**: system prompt with output contract + labelling rules
+  (language, brevity, in-batch consistency); user prompt with the
+  micro-batch's transactions. Fields are embedded with delimiters and
+  control-character stripping (prompt-injection mitigation).
+- **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>`
+  (grammar-constrained: `results[].{index,label[,rationale]}`, label 1–64
+  chars — no enum, labels are free-form). `num_ctx` explicit (default 8192),
+  `num_predict` capped (768), `temperature` 0, `think` false,
+  `keep_alive: "10m"`. Retries: 2 attempts (3 total) with exponential backoff
+  + jitter, connect timeout 3 s, total timeout 30 s per attempt; 429 and 5xx
+  are transient; timeouts degrade item-wise. On 503 the API responds with
+  `Retry-After: 5`.
+- **Label sanitizer**: labels are free model output — trimmed, whitespace
+  collapsed, control chars stripped, hard-capped at 64 chars.
+- **Validation/pipeline**: results are mapped to transactions **by position**
+  (model-echoed indices are never trusted). Empty/missing labels get one
+  individual retry (semaphore-bounded), then a generic fallback label
+  (`Sonstige Ausgaben`/`Sonstige Einnahmen`, localized for de/en).
 
 ## API
 
@@ -109,55 +84,27 @@ batch too large, `503` LLM backend unreachable/overloaded (with `Retry-After:
 5`). LLM timeouts never produce 504 — they degrade item-wise to fallback
 (see ADR-004).
 
-`POST /v1/label`
+`POST /v1/label` — single transaction; `POST /v1/label:batch` — up to
+`TL_MAX_BATCH` (default 100), input order preserved, item-wise fallback.
 
-```json
-{
-  "transaction": {
-    "id": "tx1",
-    "counterparty": "REWE SAGT DANKE",
-    "purpose": "Einkauf 14.02",
-    "amount": -42.13,
-    "currency": "EUR",
-    "date": "2026-02-14"
-  },
-  "options": { "language": "de", "include_rationale": false }
-}
-```
-
-Response:
+Response (both endpoints):
 
 ```json
 {
   "results": [
-    {
-      "id": "tx1",
-      "category": "groceries",
-      "category_label": "Lebensmittel",
-      "direction": "expense",
-      "model": "qwen3.5:4b",
-      "status": "ok"
-    }
+    { "id": "tx-1", "label": "Lebensmittel", "model": "qwen3.5:4b" }
   ],
   "batch_ms": 412
 }
 ```
 
-`category` is the **canonical slug** (stable across languages, ASCII) — it is
-the model-facing enum value and the API identifier. `category_label` is the
-localized display name for the requested language; clients must key on
-`category`, not the label. `status` is `ok` or `fallback_unknown` (taxonomy
-retry failed for that item → labelled `other_expense`/`other_income`); a batch
-never fails wholesale because of individual items.
+`label` is the only payload the client needs: the LLM-generated category
+name in the requested language. `rationale` appears only when
+`include_rationale: true` is set. `id` echoes the input. `model` names the
+Ollama model.
 
-`POST /v1/label:batch` — same, with `"transactions": [...]` (max 100 per request;
-larger batches must be chunked client-side — a sync request must complete within
-typical client timeouts). Latency is reported per request (`batch_ms`), not per
-item, since items share prompts.
-
-Direction (income/expense) is derived from the sign of `amount` deterministically;
-`amount == 0` defaults to `expense` (spending) unless the taxonomy category is an
-income category. The LLM only classifies the *category* within that direction.
+Direction is *not* returned: it is implied by the amount sign and the model
+sees the signed amount.
 
 ### Configuration (environment)
 
@@ -173,98 +120,78 @@ income category. The LLM only classifies the *category* within that direction.
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
 | `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
-| `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
-| `TL_TAXONOMY` | built-in | Path to JSON taxonomy override |
+| `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
 
-Language precedence: `options.language` > `TL_LANGUAGE`. If a taxonomy lacks a
-translation for the requested language, fall back to the taxonomy's canonical
-language (German by default) and log a warning.
+Language precedence: `options.language` > `TL_LANGUAGE`.
 
-**Ollama-side parallelism**: real parallelism requires `OLLAMA_NUM_PARALLEL` (e.g. 4)
-and `OLLAMA_MAX_LOADED_MODELS` on the Ollama server; otherwise `TL_CONCURRENCY`
-requests queue inside Ollama. Documented in README; `keep_alive` set per request.
+**Ollama-side parallelism**: real parallelism requires `OLLAMA_NUM_PARALLEL`
+(e.g. 4) and `OLLAMA_MAX_LOADED_MODELS` on the Ollama server; otherwise
+`TL_CONCURRENCY` requests queue inside Ollama. Documented in README;
+`keep_alive` set per request.
 
-### Taxonomy
+### VRAM budget
 
-Labels use **canonical ASCII slugs** as identifiers (model-facing enum + API
-`category`), with localized display names. Built-in default (canonical names in
-parentheses):
-
-- Income: `salary_income` (Einkommen), `refund` (Erstattung), `transfer` (Übertragung), `other_income` (Sonstige Einnahmen)
-- Expense: `housing` (Wohnen), `groceries` (Lebensmittel), `dining` (Restaurant & Café), `transport` (Transport & Mobilität), `shopping` (Shopping), `health` (Gesundheit), `leisure` (Freizeit & Unterhaltung), `subscriptions` (Abos & Dienstleistungen), `insurance` (Versicherungen), `savings_investing` (Sparen & Investieren), `education` (Bildung), `donations` (Spenden), `taxes_fees` (Steuern & Gebühren), `cash_withdrawal` (Bargeld), `credit_card_settlement` (Kreditkartenabrechnung), `transfer` (Übertragung), `other_expense` (Sonstige Ausgaben)
-
-Every taxonomy must provide a generic fallback category for both directions
-(`other_income`/`other_expense`, or any slug containing `other` with the right
-direction); startup fails otherwise. Custom taxonomies can be provided via
-`TL_TAXONOMY` JSON file with per-language names and an explicit per-category
-`direction` (income|expense).
-
-### VRAM budget enforcement
-
-KV-cache math (derivation): Qwen3.5-4B KV is small (GQA, 4 KV heads, partial
-attention layers); at `num_ctx=8192`, fp16 KV ≈ 50–80 MB per request — 4 concurrent
-requests ≈ ≤ 320 MB. Weights 3.4 GB + KV + CUDA context/driver (~500 MB) +
-desktop/compositor reserve (headless server assumed; ~300 MB if present) ≈
-**~4.6 GB worst case**, well within 8 GB.
+KV-cache math: Qwen3.5-4B KV is small (GQA, 4 KV heads, partial attention);
+at `num_ctx=8192`, fp16 KV ≈ 50–80 MB per request — 4 concurrent requests ≈
+≤ 320 MB. Weights 3.4 GB + KV + CUDA context/driver (~500 MB) +
+desktop/compositor reserve (~300 MB if present) ≈ **~4.6 GB worst case**,
+well within 8 GB.
 
 Advisory check at startup: query Ollama `/api/tags` for the model's `size`;
-warn (exit non-zero with `--strict-vram`) if weights exceed
-`TL_VRAM_BUDGET_MB × 0.8` (20% reserve for KV + runtime). `qwen3.5:9b` (6.6 GB)
-passes this check only when `TL_VRAM_BUDGET_MB` is raised or strict mode is off —
-documented as an advanced option, not a default.
+warn (exit non-zero with `TL_STRICT_VRAM`) if weights exceed
+`TL_VRAM_BUDGET_MB × 0.8`.
 
 ## Testing strategy
 
-1. **Unit tests** (in-crate): prompt building (language, taxonomy injection), JSON
-   schema generation, response parsing/validation (incl. diacritic/case tolerance),
-   direction derivation, config parsing.
-2. **Integration tests**: spin the axum app with a **mock LLM server** (tiny HTTP
-   server in tests) that returns canned/adaptive JSON; assert end-to-end API
-   behaviour, concurrency limits (mock delays + counting), retry/fallback paths.
-3. **Golden result tests**: `tests/golden/*.json` with real-world-style transactions
-   (German, English) and expected canonical slugs. Golden cases include edge cases:
-   ATM withdrawal, credit-card settlement, `amount = 0`, umlauts/SEPA codes in
-   purpose text. The test asserts the pipeline (prompt → mock response → validation
-   → response mapping) is correct; *result correctness* against a real model is
-   covered by the live eval.
-4. **Live evaluation harness** (`--ignored` test, requires running Ollama):
-   `cargo test -- --ignored live_eval` runs the golden set against the real model
-   with `temperature = 0` and a pinned model tag, reports per-category recall and a
-   confusion list; asserted macro accuracy ≥ 0.8 (measured 0.90 on the bundled
-   set with `qwen3.5:4b`, stable across runs at temperature 0). Some categories
-   have a single sample; the set is a smoke eval, not a benchmark. Skipped by
-   default so CI needs no GPU.
-5. **Language-switch end-to-end test**: same request with `language: de` vs `en`
-   must yield identical `category` slugs and different `category_label`s.
- 6. **Parser robustness tests**: markdown-fenced JSON, surrounding prose,
-    brace-in-string, duplicate entries, out-of-range indices, garbage output.
- 7. **Batch load test**: batch requests against the mock with per-call
-    delay assert bounded concurrency (≤ `TL_CONCURRENCY` in flight) and item-wise
-    fallback for failing items.
+1. **Unit tests** (in-crate): prompt building (language, rules), JSON schema
+   generation (no enum, label length bounds), response parsing/label
+   sanitization (fences, prose, brace-in-string, whitespace, length cap),
+   fallback language selection, config parsing.
+2. **Integration tests**: spin the axum app with a **mock LLM server** that
+   returns canned/adaptive JSON; assert end-to-end API behaviour, minimal
+   response shape, concurrency limits (mock delays + in-flight counters),
+   retry/fallback paths, OpenAPI spec content.
+3. **Golden result tests**: `tests/golden/cases.json` — 20 real-world-style
+   transactions (German, English) through the pipeline against the mock;
+   exact positional/label/id assertions.
+4. **Live evaluation harness** (`--ignored`, requires running Ollama):
+   the whole set labelled in **one request** (dynamic labels are
+   batch-consistent, so single-batch is the honest evaluation); each case
+   lists semantically acceptable labels and the produced label must match
+   one. Measured **1.00** with `qwen3.5:4b`, stable across runs at
+   temperature 0. Asserts ≥ 0.8; skipped by default so CI needs no GPU.
+5. **Parser robustness tests**: markdown-fenced JSON, surrounding prose,
+   brace-in-string, duplicate entries, out-of-range indices, garbage output.
 
 ## Git flow
 
-- `main`: releasable only. `develop`: integration. Features via `feature/*`, release
-  via `release/*`, fixes via `fix/*` or `hotfix/*` from main. Tags `vX.Y.Z` on main.
+- `main`: releasable only. `develop`: integration. Features via `feature/*`,
+  release via `release/*`, fixes via `fix/*` or `hotfix/*` from main.
+  Tags `vX.Y.Z` on main.
 
 ## Dependencies
 
 axum, tokio, reqwest (rustls), serde/serde_json, tracing/tracing-subscriber,
-thiserror, futures, rand.
+thiserror, futures, rand, utoipa + utoipa-swagger-ui (OpenAPI docs).
 
 ## Risks & mitigations
 
-- **Model hallucinates label outside taxonomy** → constrained decoding (schema
-  `format`) + post-validation + retry + fallback to `other_income`/`other_expense`.
-- **Ollama unavailable** → `/v1/health` reports degraded; batch returns 503 with
-  structured error and `Retry-After`.
-- **Slow model** → micro-batching (fewer calls), semaphore concurrency, per-attempt
-  timeout (30 s), 2 retries with backoff.
+- **Label wording drifts between requests** → inherent to dynamic labels;
+  mitigated by in-batch consistency instruction and temperature 0. Clients
+  normalize downstream if they need stable grouping.
+- **Model emits empty/garbage labels** → grammar-constrained decoding
+  (min/max length) + sanitizer + per-item retry + localized fallback label.
+- **Prompt injection via transaction fields** → field sanitization; worst
+  case is a wrong label, no data leaves the machine either way.
+- **Ollama unavailable** → `/v1/health` reports degraded; requests return 503
+  with structured error and `Retry-After`.
+- **Slow model** → micro-batching, semaphore concurrency, per-attempt
+  timeout (30 s), 2 retries with backoff; timeouts degrade item-wise.
 - **VRAM overflow** → startup check vs budget; default model chosen at 3.4 GB.
 
 ## Observability
 
-`tracing` structured logs; per-batch log line includes item count, fallback
-count, and latency. (Request-ID middleware is future work.) Startup logs the resolved config, VRAM
-check result, and taxonomy size. `/v1/health` reports backend reachability.
+`tracing` structured logs; per-batch log line includes item count and
+latency. Startup logs the resolved config and VRAM check result.
+`/v1/health` reports backend reachability.

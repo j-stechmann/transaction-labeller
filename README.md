@@ -1,28 +1,28 @@
 # transaction-labeller
 
-A local REST service that labels bank transactions with **spending/income
-categories** using an LLM served by [Ollama](https://ollama.com) — no cloud
-inference, no data leaves the machine. Designed for an 8 GB VRAM budget
-(e.g. RTX 3070 Ti).
+A local REST service that labels bank transactions with **category names
+generated dynamically by an LLM** via [Ollama](https://ollama.com) — no cloud
+inference, no data leaves the machine. The client receives **only the label**:
+there is no fixed taxonomy, no slug registry, no database. The LLM invents
+short, consistent category names in the language you request.
 
 ```
 Client ──HTTP──▶ axum REST API ──▶ pipeline (chunk → parallel LLM calls →
-                                 validate → retry → fallback) ──▶ Ollama
+                                 sanitize → retry → fallback) ──▶ Ollama
 ```
 
 ## Features
 
-- **REST API**: single + batch endpoints, uniform error envelope, health & taxonomy
+- **Dynamic labels**: the LLM invents the category names (`Lebensmittel`,
+  `Groceries`, `Miete`, …) — nothing is pre-determined
+- **Only the label**: response per transaction is `{id, label, [rationale], model}` — nothing else
+- **REST API**: single + batch endpoints, uniform error envelope, health
 - **Parallel labelling**: transactions are chunked into micro-batches (several
-  transactions per prompt) and processed by a semaphore-bounded pool of
-  concurrent LLM calls
-- **Guaranteed taxonomy**: the model decodes against a JSON-schema enum
-  (grammar-constrained) and every label is re-validated server-side; failures
-  retry individually, then fall back to `other_expense`/`other_income`
+  transactions per prompt), run through a semaphore-bounded pool of
+  concurrent LLM calls; the model is instructed to keep wording consistent
+  within a batch
 - **Configurable label language** per request (`options.language`, ISO 639-1)
-  or server-wide (`TL_LANGUAGE`); labels are stable via canonical ASCII slugs
-- **Direction safety**: income categories can never be attached to outflows
-  (and vice versa) — checked against the taxonomy's per-category direction
+  or server-wide (`TL_LANGUAGE`)
 - **8 GB VRAM aware**: startup advisory check against the Ollama model list;
   default model `qwen3.5:4b` uses ~3.4 GB
 
@@ -35,12 +35,13 @@ Client ──HTTP──▶ axum REST API ──▶ pipeline (chunk → parallel 
 | Alternatives | `gemma4:12b` (better raw quality, 7.6 GB — no concurrency headroom), `qwen3:8b` (thinking model, 5.2 GB), `qwen3.5:9b` (6.6 GB, tight) |
 
 Measured on the bundled golden set (20 real-world-style German/English
-transactions, temperature 0): **0.90 macro accuracy**, stable across runs
+transactions, temperature 0, one batch): **1.00 label accuracy** against
+semantic acceptability sets — stable across runs
 (`cargo test -- --ignored live_eval --nocapture`).
 
 > **Note**: `qwen3.5` is a *thinking* model. transaction-labeller sends
 > `think: false` — otherwise the model burns its entire output budget on
-> reasoning and never emits the classification.
+> reasoning and never emits the label.
 
 ## Quick start
 
@@ -72,17 +73,14 @@ curl -s localhost:8080/v1/label -H 'content-type: application/json' -d '{
 }'
 ```
 
-Response:
+Response — only the label:
 
 ```json
 {
   "results": [
     {
       "id": "tx-1",
-      "category": "groceries",
-      "category_label": "Lebensmittel",
-      "direction": "expense",
-      "status": "ok",
+      "label": "Lebensmittel",
       "model": "qwen3.5:4b"
     }
   ],
@@ -90,37 +88,33 @@ Response:
 }
 ```
 
+With `"include_rationale": true` each result additionally carries a short
+`rationale` string.
+
 ## API
+
+Interactive OpenAPI documentation is served by the binary:
+
+- **Swagger UI**: `http://127.0.0.1:8080/swagger-ui`
+- **OpenAPI 3.1 JSON**: `http://127.0.0.1:8080/api-docs/openapi.json`
 
 ### `POST /v1/label`
 
-Label a single transaction.
+Label a single transaction. Body: `{"transaction": {...}, "options": {...}}`.
 
 ### `POST /v1/label:batch`
 
 Label up to `TL_MAX_BATCH` (default 100) transactions in one request.
 Larger volumes: chunk client-side. The response preserves input order
-(`results[i]` corresponds to `transactions[i]`); a batch never fails
-wholesale because of one bad item — that item gets
-`"status": "fallback_unknown"` with category `other_expense`/`other_income`.
+(`results[i]` corresponds to `transactions[i]`). A batch never fails
+wholesale because of one bad item — that item receives a generic fallback
+label (`Sonstige Ausgaben` / `Sonstige Einnahmen`, English equivalents for
+other languages).
 
 ### `GET /v1/health`
 
 Liveness + Ollama reachability. `200 {"status":"ok"}` or
 `503 {"status":"degraded", ...}`.
-
-### `GET /v1/taxonomy?language=en`
-
-Effective taxonomy: `{"language":"en","categories":[{"slug":"groceries","label":"Groceries"}, ...]}`.
-
-### API documentation (OpenAPI + Swagger UI)
-
-Machine-readable OpenAPI 3.1 is generated from the code and served by the
-binary — always in sync with the implementation:
-
-- **Interactive UI**: `http://127.0.0.1:8080/swagger-ui` (try endpoints in-browser)
-- **OpenAPI JSON**: `http://127.0.0.1:8080/api-docs/openapi.json`
-  (import into Postman/Insomnia, or generate client SDKs)
 
 ### Errors
 
@@ -133,12 +127,14 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 | 422 | body parses but fails validation (e.g. non-finite amount) |
 | 503 | LLM backend unreachable/overloaded (`Retry-After: 5`) |
 
-### Field semantics
+### Response field semantics
 
-- `category` — canonical ASCII slug, **stable across languages**. Key on this.
-- `category_label` — localized display name for the requested language.
-- `direction` — derived from the amount sign (`amount == 0` → expense).
-- `status` — `ok` or `fallback_unknown` (label could not be validated).
+- `label` — the LLM-generated category name in the requested language.
+  Free-form: wording may vary between requests; only the language is
+  guaranteed. Normalize downstream if you need stable grouping.
+- `id` — echoes the input transaction id.
+- `rationale` — only present when requested via `include_rationale`.
+- `model` — the Ollama model tag that produced the label.
 
 ## Configuration (environment)
 
@@ -156,31 +152,16 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory VRAM budget |
 | `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
-| `TL_TAXONOMY` | built-in | Path to a custom taxonomy JSON |
 
 VRAM math (default config): 3.4 GB weights + ≤ ~320 MB KV cache (4 × 8192 ctx)
 + ~800 MB CUDA/driver/desktop ≈ **4.6 GB worst case** on an 8 GB card.
 
-## Custom taxonomy
+## Label language
 
-```json
-{
-  "categories": [
-    { "slug": "food", "direction": "expense", "names": { "de": "Essen", "en": "Food" } },
-    { "slug": "my_income", "names": { "en": "My Income" } }
-  ]
-}
-```
-
-- `slug`: lowercase ASCII + underscores; this is the model-facing enum value
-  and the API identifier.
-- `direction`: `income` or `expense`. Optional only when inferable from the
-  slug (`*_income` / `*_expense`).
-- `names`: display names per ISO 639-1 code; unknown languages fall back to
-  `de`, then to any provided name.
-- A generic fallback category (`other_income`/`other_expense` or any slug
-  containing `other`) must exist for **both directions**, otherwise startup
-  fails.
+Request `options.language` (ISO 639-1) or set `TL_LANGUAGE`. The system
+prompt instructs the model to write the entire label in that language; the
+generic fallback labels are localized for `de` and `en` and default to
+English otherwise.
 
 ## Testing
 
@@ -189,22 +170,28 @@ cargo test                                   # unit + integration + golden (mock
 cargo test -- --ignored live_eval --nocapture  # live eval against real Ollama (needs model)
 ```
 
-- **Unit tests**: config parsing, taxonomy validation, prompt rendering,
-  schema generation, positional output parsing (markdown fences, prose,
-  brace-in-string), direction derivation.
+- **Unit tests**: config parsing, prompt rendering, schema generation,
+  positional label parsing (markdown fences, prose, brace-in-string),
+  label sanitization, fallback language selection.
 - **Integration tests** (`tests/integration.rs`): full HTTP API against a
-  mock Ollama (`tests/mock_llm.rs`) — API contract, concurrency bounds,
-  item-wise fallback, transient-500 retry, uniform errors.
+  mock Ollama (`tests/mock_llm.rs`) — API contract, minimal response shape,
+  concurrency bounds, item-wise fallback, transient-500 retry, uniform
+  errors, OpenAPI spec content.
 - **Golden tests** (`tests/golden/`): 20 real-world-style transactions run
-  through the pipeline; contract preservation asserted deterministically.
-- **Live eval** (`--ignored`): same set against the real model with
-  temperature 0; reports per-category recall and confusions; asserts ≥ 0.8.
+  through the pipeline; contract preservation asserted deterministically
+  against the mock.
+- **Live eval** (`--ignored`): the whole set labelled in **one request**
+  (dynamic labels are batch-consistent, so single-batch is the honest
+  evaluation); each case lists semantically acceptable labels, and the
+  produced label must match one of them. Asserts ≥ 0.8 (measured 1.00 with
+  `qwen3.5:4b`, stable across runs at temperature 0).
 
 ## Operations
 
 - Graceful shutdown on SIGTERM/SIGINT (in-flight requests finish).
 - Retries: transient failures (network, 429, 5xx) get 2 attempts with
-  exponential backoff + jitter; timeouts degrade item-wise to fallback.
+  exponential backoff + jitter; timeouts degrade item-wise to the fallback
+  label.
 - Structured logs via `tracing` (`RUST_LOG=transaction_labeller=debug`).
 - The service performs **no authentication**; keep it on loopback (a warning
   is logged when binding non-loopback).
@@ -215,4 +202,5 @@ cargo test -- --ignored live_eval --nocapture  # live eval against real Ollama (
 on `feature/*`, releases via `release/*` → `main` (tagged `vX.Y.Z`), urgent
 fixes via `hotfix/*` from `main`.
 
-See [docs/design.md](docs/design.md) for the full design document.
+See [docs/design.md](docs/design.md) for the full design document and
+[docs/adr.md](docs/adr.md) for decision records.
