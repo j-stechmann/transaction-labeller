@@ -227,6 +227,67 @@ async fn empty_labels_fall_back_itemwise() {
 }
 
 #[tokio::test]
+async fn fallback_labels_are_not_recorded_into_library() {
+    // Isolated library file for this test run.
+    let lib_path = std::env::temp_dir().join(format!(
+        "tl-it-fallback-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let b = MockBehaviour {
+        keyword_map: default_keyword_map(),
+        empty_labels: true, // every item degrades to the fallback label
+        ..MockBehaviour::default()
+    };
+    let m = spawn_with(b).await;
+    let cfg = test_config(&m.url(), &[]);
+    let cfg = transaction_labeller::config::Config {
+        label_library: lib_path.to_string_lossy().to_string(),
+        ..cfg
+    };
+    let service = Arc::new(LabelService::new(&cfg));
+    let app = transaction_labeller::router::build_router(Arc::clone(&service), cfg.max_batch);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let (status, body) = post_json(
+        &url,
+        "/v1/label:batch",
+        json!({"transactions": [tx("a", -5.0, "REWE", "x"), tx("b", 100.0, "ACME", "Gehalt")]}),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    // Every slot is filled with the fallback — but the library must stay
+    // empty, otherwise a flaky-backend burst would rank the generic label
+    // first and inject it into every future prompt.
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results[0]["label"], "Sonstige Ausgaben");
+    assert_eq!(results[1]["label"], "Sonstige Einnahmen");
+
+    let res = reqwest::Client::new()
+        .get(format!("{url}/v1/labels?language=de"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(
+        list["labels"],
+        json!([]),
+        "fallback labels must not be recorded"
+    );
+
+    let _ = std::fs::remove_file(&lib_path);
+}
+
+#[tokio::test]
 async fn garbage_output_falls_back_itemwise() {
     let b = MockBehaviour {
         keyword_map: default_keyword_map(),

@@ -27,6 +27,22 @@ pub enum LabelFailure {
     Backend(LlmError),
 }
 
+/// Outcome of validating one chunk: the positional results (fallbacks
+/// included — every slot must stay filled) plus the subset of labels the
+/// model actually produced, which is what the library records.
+struct ValidatedChunk {
+    results: Vec<LabeledTransaction>,
+    model_labels: Vec<String>,
+}
+
+/// True when `label` is one of the generic fallbacks for `language`. The
+/// shipped defaults are static strings, so this is exact. If a model happens
+/// to return the fallback wording on its own it is also skipped from
+/// recording — harmless (a generic label is never worth learning anyway).
+fn is_fallback_label(language: &str, label: &str) -> bool {
+    label == default_expense_label(language) || label == default_income_label(language)
+}
+
 impl LabelService {
     pub fn new(cfg: &Config) -> Self {
         let library = if cfg.label_library.is_empty() {
@@ -119,13 +135,13 @@ impl LabelService {
                 continue;
             }
             let validated = self.validate_chunk(&chunk, raw, &language).await;
-            // Learn: every label actually returned (not fallbacks) grows the
-            // library so future wording stays consistent.
+            // Learn: only labels the model actually produced grow the library.
+            // Fallback labels are excluded so a flaky-backend burst cannot
+            // inflate the generic label into the top-ranked prompt entry.
             if let Some(lib) = &self.library {
-                let used: Vec<String> = validated.iter().map(|r| r.label.clone()).collect();
-                lib.record(&language, &used);
+                lib.record(&language, &validated.model_labels);
             }
-            slots.push(validated);
+            slots.push(validated.results);
         }
 
         let mut results: Vec<LabeledTransaction> = Vec::with_capacity(transactions.len());
@@ -152,13 +168,15 @@ impl LabelService {
 
     /// Validates positional raw labels. Order is preserved: slot `i` of the
     /// output corresponds to `chunk[i]`. Empty/missing labels get one
-    /// individual retry, then a generic fallback label.
+    /// individual retry, then a generic fallback label. `model_labels` holds
+    /// only the labels the model produced (retries included), so callers can
+    /// record them without polluting the library with fallbacks.
     async fn validate_chunk(
         &self,
         chunk: &[Transaction],
         raw: Vec<Option<RawLabel>>,
         language: &str,
-    ) -> Vec<LabeledTransaction> {
+    ) -> ValidatedChunk {
         let mut out: Vec<Option<LabeledTransaction>> = vec![None; chunk.len()];
         let mut needs_retry: Vec<(usize, Transaction)> = Vec::new();
 
@@ -199,9 +217,18 @@ impl LabelService {
             }
         }
 
-        out.into_iter()
-            .map(|o| o.expect("every slot is filled"))
-            .collect()
+        let mut results = Vec::with_capacity(out.len());
+        let mut model_labels = Vec::new();
+        for o in out.into_iter().flatten() {
+            if !is_fallback_label(language, &o.label) {
+                model_labels.push(o.label.clone());
+            }
+            results.push(o);
+        }
+        ValidatedChunk {
+            results,
+            model_labels,
+        }
     }
 
     async fn classify_single(&self, tx: &Transaction, language: &str) -> Option<String> {
@@ -287,5 +314,19 @@ mod tests {
         let svc = LabelService::new(&cfg);
         let res = svc.label(vec![tx("a", -5.0, "X", "Y")], "de".into()).await;
         assert!(matches!(res, Err(LabelFailure::Backend(_))));
+    }
+
+    #[test]
+    fn is_fallback_label_detects_shipped_defaults_only() {
+        assert!(is_fallback_label("de", "Sonstige Ausgaben"));
+        assert!(is_fallback_label("de", "Sonstige Einnahmen"));
+        assert!(is_fallback_label("en", "Other expenses"));
+        assert!(is_fallback_label("en", "Other income"));
+        assert!(!is_fallback_label("de", "Lebensmittel"));
+        assert!(
+            !is_fallback_label("de", "Sonstige Ausgaben "),
+            "no trimming"
+        );
+        assert!(!is_fallback_label("fr", "Sonstige Ausgaben"));
     }
 }
