@@ -25,6 +25,12 @@ pub fn language_display(lang: &str) -> &str {
         .unwrap_or("English")
 }
 
+/// System prompt with taxonomy injected. Separate entry point so the LLM
+/// client can render it per-request language without owning a Taxonomy handle.
+pub fn system_prompt_text(lang: &str) -> String {
+    system_prompt(&crate::taxonomy::builtin(), lang)
+}
+
 /// Renders the system prompt: role, rules, taxonomy (localized), output contract.
 pub fn system_prompt(tax: &Taxonomy, lang: &str) -> String {
     let lang_name = language_display(lang);
