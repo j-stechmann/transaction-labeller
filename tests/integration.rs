@@ -408,6 +408,69 @@ async fn health_and_taxonomy_endpoints() {
 }
 
 #[tokio::test]
+async fn openapi_docs_are_served() {
+    let m = spawn_with(MockBehaviour::default()).await;
+    let (url, _cfg) = spawn_app(&m, &[]).await;
+    let client = reqwest::Client::new();
+
+    // OpenAPI JSON: valid, versioned, all 4 operations + key schemas present.
+    let res = client
+        .get(format!("{url}/api-docs/openapi.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let spec: Value = res.json().await.unwrap();
+    assert_eq!(
+        spec["openapi"].as_str().unwrap().split('.').next(),
+        Some("3")
+    );
+    assert_eq!(spec["info"]["title"], "transaction-labeller");
+
+    let paths = spec["paths"].as_object().unwrap();
+    for p in ["/v1/label", "/v1/label:batch", "/v1/health", "/v1/taxonomy"] {
+        assert!(paths.contains_key(p), "spec missing path {p}");
+    }
+    assert!(paths["/v1/label"]["post"].is_object());
+    assert!(paths["/v1/label:batch"]["post"].is_object());
+    assert!(paths["/v1/health"]["get"].is_object());
+    assert!(paths["/v1/taxonomy"]["get"].is_object());
+
+    let schemas = spec["components"]["schemas"].as_object().unwrap();
+    for s in [
+        "Transaction",
+        "LabelOptions",
+        "LabelSingleRequest",
+        "LabelBatchRequest",
+        "LabelResult",
+        "BatchResponse",
+        "ApiError",
+        "HealthResponse",
+        "TaxonomyResponse",
+        "Direction",
+        "ItemStatus",
+    ] {
+        assert!(schemas.contains_key(s), "spec missing schema {s}");
+    }
+
+    // LabelResult schema carries the field semantics docs.
+    let lr = &schemas["LabelResult"];
+    assert!(lr["properties"]["category"].is_object());
+    assert!(lr["properties"]["category_label"].is_object());
+    assert!(lr["properties"]["status"].is_object());
+
+    // Swagger UI HTML is served and references the spec.
+    let res = client
+        .get(format!("{url}/swagger-ui"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let html = res.text().await.unwrap();
+    assert!(html.contains("swagger"), "swagger-ui HTML must be served");
+}
+
+#[tokio::test]
 async fn unreachable_backend_returns_503_with_retry_after() {
     // App pointed at a closed port.
     let cfg = test_config("http://127.0.0.1:9", &[]);

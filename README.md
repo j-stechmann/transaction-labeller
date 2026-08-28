@@ -113,6 +113,15 @@ Liveness + Ollama reachability. `200 {"status":"ok"}` or
 
 Effective taxonomy: `{"language":"en","categories":[{"slug":"groceries","label":"Groceries"}, ...]}`.
 
+### API documentation (OpenAPI + Swagger UI)
+
+Machine-readable OpenAPI 3.1 is generated from the code and served by the
+binary — always in sync with the implementation:
+
+- **Interactive UI**: `http://127.0.0.1:8080/swagger-ui` (try endpoints in-browser)
+- **OpenAPI JSON**: `http://127.0.0.1:8080/api-docs/openapi.json`
+  (import into Postman/Insomnia, or generate client SDKs)
+
 ### Errors
 
 Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":"...","details":[]}}`

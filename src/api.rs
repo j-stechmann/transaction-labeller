@@ -1,26 +1,15 @@
-use crate::model::{ApiError, ItemStatus, LabelOptions, Transaction};
+use crate::model::{
+    ApiError, BatchResponse, HealthResponse, ItemStatus, LabelBatchRequest, LabelOptions,
+    LabelSingleRequest, TaxonomyEntry, TaxonomyResponse, Transaction,
+};
 use crate::pipeline::{LabelFailure, LabelService, RETRY_AFTER_SECS};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
-
-#[derive(Debug, Deserialize)]
-pub struct LabelSingleRequest {
-    pub transaction: Transaction,
-    #[serde(default)]
-    pub options: LabelOptions,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LabelBatchRequest {
-    pub transactions: Vec<Transaction>,
-    #[serde(default)]
-    pub options: LabelOptions,
-}
+use utoipa::OpenApi;
 
 pub struct ApiState {
     pub service: Arc<LabelService>,
@@ -98,6 +87,18 @@ fn api_err(err: ApiError, status: StatusCode, headers: Option<(&str, &str)>) -> 
 }
 
 /// POST /v1/label — single transaction.
+#[utoipa::path(
+    post,
+    path = "/v1/label",
+    request_body = LabelSingleRequest,
+    responses(
+        (status = 200, description = "Transaction labelled", body = BatchResponse),
+        (status = 400, description = "Invalid input (bad language, over-long field)", body = ApiError),
+        (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
+        (status = 503, description = "LLM backend unreachable/overloaded; Retry-After: 5", body = ApiError)
+    ),
+    tag = "labelling"
+)]
 pub async fn label_single(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<LabelSingleRequest>,
@@ -132,6 +133,19 @@ pub async fn label_single(
 }
 
 /// POST /v1/label:batch — parallel labelling of up to `max_batch` transactions.
+#[utoipa::path(
+    post,
+    path = "/v1/label:batch",
+    request_body = LabelBatchRequest,
+    responses(
+        (status = 200, description = "Transactions labelled in parallel; input order preserved; items never fail wholesale (fallback_unknown instead)", body = BatchResponse),
+        (status = 400, description = "Empty batch, duplicate ids, bad language, over-long fields", body = ApiError),
+        (status = 413, description = "Batch exceeds TL_MAX_BATCH (default 100)", body = ApiError),
+        (status = 422, description = "Body fails validation (e.g. non-finite amount)", body = ApiError),
+        (status = 503, description = "LLM backend unreachable/overloaded; Retry-After: 5", body = ApiError)
+    ),
+    tag = "labelling"
+)]
 pub async fn label_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<LabelBatchRequest>,
@@ -206,6 +220,15 @@ fn failure_to_response(failure: LabelFailure) -> Response {
 }
 
 /// GET /v1/health — liveness + backend reachability.
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    responses(
+        (status = 200, description = "Service alive and Ollama reachable", body = HealthResponse),
+        (status = 503, description = "Service alive but backend degraded", body = HealthResponse)
+    ),
+    tag = "service"
+)]
 pub async fn health(State(state): State<Arc<ApiState>>) -> Response {
     match state.service.client().health().await {
         Ok(()) => (
@@ -222,6 +245,18 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Response {
 }
 
 /// GET /v1/taxonomy — effective taxonomy: slugs + localized display names.
+#[utoipa::path(
+    get,
+    path = "/v1/taxonomy",
+    params(
+        ("language" = Option<String>, Query, description = "ISO 639-1 code; defaults to TL_LANGUAGE. Unknown codes fall back to canonical names.")
+    ),
+    responses(
+        (status = 200, description = "Effective taxonomy", body = TaxonomyResponse),
+        (status = 400, description = "Malformed language parameter", body = ApiError)
+    ),
+    tag = "service"
+)]
 pub async fn taxonomy(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(q): axum::extract::Query<TaxonomyQuery>,
@@ -238,25 +273,26 @@ pub async fn taxonomy(
             None,
         );
     }
-    let cats: Vec<serde_json::Value> = state
+    let cats: Vec<TaxonomyEntry> = state
         .service
         .taxonomy()
         .iter()
-        .map(|c| {
-            serde_json::json!({
-                "slug": c.slug,
-                "label": c.display_name(&lang),
-            })
+        .map(|c| TaxonomyEntry {
+            slug: c.slug.clone(),
+            label: c.display_name(&lang).to_string(),
         })
         .collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "language": lang, "categories": cats })),
+        Json(TaxonomyResponse {
+            language: lang,
+            categories: cats,
+        }),
     )
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct TaxonomyQuery {
     language: Option<String>,
 }
@@ -297,3 +333,42 @@ pub async fn vram_check_service(
         }
     }
 }
+
+/// OpenAPI specification root: aggregates all schemas and operations.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "transaction-labeller",
+        version = "0.1.0",
+        description = "Labels bank transactions with spending/income categories using a local LLM (Ollama). Labels are grammar-constrained to a fixed taxonomy and re-validated server-side. Direction is derived from the amount sign; label language is configurable per request.",
+        license(name = "MIT")
+    ),
+    paths(
+        crate::api::label_single,
+        crate::api::label_batch,
+        crate::api::health,
+        crate::api::taxonomy
+    ),
+    components(
+        schemas(
+            crate::model::Transaction,
+            crate::model::LabelOptions,
+            crate::model::LabelSingleRequest,
+            crate::model::LabelBatchRequest,
+            crate::model::LabelResult,
+            crate::model::BatchResponse,
+            crate::model::Direction,
+            crate::model::ItemStatus,
+            crate::model::ApiError,
+            crate::model::ErrorBody,
+            crate::model::HealthResponse,
+            crate::model::TaxonomyEntry,
+            crate::model::TaxonomyResponse
+        )
+    ),
+    tags(
+        (name = "labelling", description = "Transaction category labelling"),
+        (name = "service", description = "Service metadata: health, taxonomy")
+    )
+)]
+pub struct ApiDoc;

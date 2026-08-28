@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Direction derived deterministically from the amount sign.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Income,
@@ -34,18 +35,31 @@ impl Direction {
 
 /// A single banking transaction to be labelled. `amount` must be finite
 /// (NaN and ±Infinity rejected at deserialization).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct Transaction {
+    /// Unique identifier within the request; echoed back in results.
+    #[schema(example = "tx-1", max_length = 512)]
     pub id: String,
+    /// Payee (outgoing) or payer (incoming) name.
     #[serde(default)]
+    #[schema(example = "REWE SAGT DANKE", max_length = 512)]
     pub counterparty: String,
+    /// Purpose / reference line from the statement.
     #[serde(default)]
+    #[schema(example = "Einkauf 14.02", max_length = 512)]
     pub purpose: String,
+    /// Signed amount; negative = outflow (expense), positive = inflow (income),
+    /// zero defaults to expense. Must be finite.
     #[serde(deserialize_with = "deserialize_finite")]
+    #[schema(example = -42.13)]
     pub amount: f64,
+    /// ISO 4217 currency code (advisory; shown to the model).
     #[serde(default = "default_currency")]
+    #[schema(example = "EUR", max_length = 8)]
     pub currency: String,
+    /// Booking date, ISO 8601 recommended.
     #[serde(default)]
+    #[schema(example = "2026-02-14", max_length = 512)]
     pub date: String,
 }
 
@@ -65,10 +79,14 @@ fn default_currency() -> String {
 }
 
 /// Per-request options; language overrides the server default.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct LabelOptions {
+    /// ISO 639-1 label language (`de`, `en`, …). Overrides `TL_LANGUAGE`.
+    #[schema(example = "de")]
     pub language: Option<String>,
+    /// Include a short model-generated rationale per result (slower).
     #[serde(default)]
+    #[schema(default = false)]
     pub include_rationale: bool,
 }
 
@@ -83,43 +101,63 @@ impl LabelOptions {
 }
 
 /// Per-item result status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemStatus {
+    /// Classified and validated against the taxonomy.
     Ok,
+    /// Label could not be validated; generic category assigned.
     FallbackUnknown,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LabelResult {
+    /// Echoes the input transaction id.
+    #[schema(example = "tx-1")]
     pub id: String,
     /// Canonical ASCII slug — stable across languages; clients key on this.
+    #[schema(example = "groceries")]
     pub category: String,
     /// Localized display name for the requested language.
+    #[schema(example = "Lebensmittel")]
     pub category_label: String,
+    /// Direction derived from the amount sign (never from the model).
     pub direction: Direction,
+    /// Short model-generated reason; present only when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Supermarket purchase")]
     pub rationale: Option<String>,
     pub status: ItemStatus,
+    /// Ollama model tag that produced the label.
+    #[schema(example = "qwen3.5:4b")]
     pub model: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BatchResponse {
+    /// One result per input transaction, in input order
+    /// (`results[i]` ↔ request transaction `i`).
     pub results: Vec<LabelResult>,
+    /// Wall-clock duration of the whole labelling pass in milliseconds.
+    #[schema(example = 468)]
     pub batch_ms: u64,
 }
 
 /// Uniform error body: `{ "error": { "code", "message", "details" } }`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ApiError {
     pub error: ErrorBody,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorBody {
+    /// Machine-readable error code (`invalid_request`, `backend_unavailable`).
+    #[schema(example = "invalid_request")]
     pub code: String,
+    /// Human-readable description.
+    #[schema(example = "duplicate transaction id \"tx-1\"; ids must be unique")]
     pub message: String,
+    /// Optional extra context (e.g. offending indices).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub details: Vec<String>,
 }
@@ -142,6 +180,54 @@ impl ApiError {
     pub fn backend_unavailable(msg: impl Into<String>) -> Self {
         Self::new("backend_unavailable", msg)
     }
+}
+
+/// `POST /v1/label` request body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LabelSingleRequest {
+    pub transaction: Transaction,
+    #[serde(default)]
+    pub options: LabelOptions,
+}
+
+/// `POST /v1/label:batch` request body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LabelBatchRequest {
+    /// 1..=`TL_MAX_BATCH` (default 100) transactions; ids must be unique.
+    pub transactions: Vec<Transaction>,
+    #[serde(default)]
+    pub options: LabelOptions,
+}
+
+/// `GET /v1/health` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    /// `ok` or `degraded`.
+    #[schema(example = "ok")]
+    pub status: String,
+    /// Backend reachability description.
+    #[schema(example = "reachable")]
+    pub backend: String,
+}
+
+/// One taxonomy entry.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaxonomyEntry {
+    /// Canonical ASCII slug (model-facing enum value, API identifier).
+    #[schema(example = "groceries")]
+    pub slug: String,
+    /// Display name in the requested language.
+    #[schema(example = "Groceries")]
+    pub label: String,
+}
+
+/// `GET /v1/taxonomy` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaxonomyResponse {
+    /// Language the labels were rendered in.
+    #[schema(example = "en")]
+    pub language: String,
+    pub categories: Vec<TaxonomyEntry>,
 }
 
 #[cfg(test)]
