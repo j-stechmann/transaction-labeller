@@ -176,18 +176,18 @@ mod tests {
 
     #[test]
     fn language_must_be_iso_code() {
-        let cfg = Config {
-            language: "german".to_string(),
-            ..Config::default()
-        };
-        let err = validate_language(&cfg);
-        assert!(err.is_err());
-    }
-
-    fn validate_language(cfg: &Config) -> Result<(), ConfigError> {
-        if cfg.language.len() != 2 || !cfg.language.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(ConfigError::InvalidValue("bad language".into()));
+        // Exercises the real from_env path end-to-end.
+        unsafe {
+            std::env::set_var("TL_LANGUAGE", "german");
         }
-        Ok(())
+        assert!(Config::from_env().is_err());
+        unsafe {
+            std::env::set_var("TL_LANGUAGE", "EN");
+        }
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.language, "en");
+        unsafe {
+            std::env::remove_var("TL_LANGUAGE");
+        }
     }
 }

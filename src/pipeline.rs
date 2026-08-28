@@ -45,9 +45,8 @@ impl LabelService {
         let fallback_expense = pick_fallback(&taxonomy, Direction::Expense).unwrap_or_else(|| {
             panic!("taxonomy must contain a generic expense category (looked for `other_expense`)")
         });
-        let slugs = taxonomy.slugs();
         Self {
-            client: Arc::new(OllamaClient::new(cfg, taxonomy.clone(), slugs)),
+            client: Arc::new(OllamaClient::new(cfg, taxonomy.clone())),
             taxonomy: Arc::new(taxonomy),
             semaphore: Arc::new(Semaphore::new(cfg.concurrency)),
             micro_batch: cfg.micro_batch,
@@ -102,7 +101,15 @@ impl LabelService {
                 };
                 let res = client.classify_batch(&req).await;
                 drop(_permit);
-                res.map(|raw| (chunk, raw))
+                // Timeout → all-None here, where the chunk is still owned:
+                // validation will send these items through per-item retry →
+                // fallback, keeping the results[i] ↔ transactions[i] contract.
+                let n = chunk.len();
+                match res {
+                    Ok(raw) => Ok((chunk, raw)),
+                    Err(LlmError::Timeout(_)) => Ok((chunk, vec![None; n])),
+                    Err(e) => Err(e),
+                }
             }));
         }
 
@@ -110,15 +117,7 @@ impl LabelService {
         for handle in handles {
             let (chunk, raw) = match handle.await {
                 Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    // Defensive: timeouts are converted to all-None upstream;
-                    // remaining backend errors fail wholesale with 503.
-                    if matches!(e, LlmError::Timeout(_)) {
-                        continue;
-                    } else {
-                        return Err(LabelFailure::Backend(e));
-                    }
-                }
+                Ok(Err(e)) => return Err(LabelFailure::Backend(e)),
                 Err(join) => {
                     return Err(LabelFailure::Backend(LlmError::Unreachable(format!(
                         "internal task failure: {join}"

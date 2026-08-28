@@ -30,10 +30,10 @@ pub fn system_prompt(tax: &Taxonomy, lang: &str) -> String {
     let lang_name = language_display(lang);
     let mut s = String::with_capacity(2048);
     s.push_str("You are a bank transaction classifier. ");
-    s.push_str("For each transaction you receive, choose exactly one category from the allowed list.\n");
-    s.push_str(&format!(
-        "Reply ONLY with a JSON object: {{\"results\":[{{\"index\":<int>,\"category\":\"<slug>\"}}]}} — one result per transaction, same order.\n"
-    ));
+    s.push_str(
+        "For each transaction you receive, choose exactly one category from the allowed list.\n",
+    );
+    s.push_str("Reply ONLY with a JSON object: {\"results\":[{\"index\":<int>,\"category\":\"<slug>\"}]} — one result per transaction, same order.\n");
     s.push_str("Rules:\n");
     s.push_str("- The response MUST be a single valid JSON object, no markdown, no extra text.\n");
     s.push_str("- `category` MUST be one of the slugs listed below, copied exactly.\n");

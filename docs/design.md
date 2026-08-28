@@ -77,14 +77,14 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…)               │
   semaphore-bounded pool of concurrent LLM calls (default 4), each call covering a
   micro-batch (default 8 transactions per prompt).
 - **Prompt builder**: renders system prompt with taxonomy + target label language +
-  few-shot examples; per-request user prompt with the micro-batch's transactions.
+  disambiguation rules; per-request user prompt with the micro-batch's transactions.
   Transaction fields are embedded in a structured block with field delimiters and
   control-character stripping (cheap prompt-injection mitigation; residual risk is
   mislabelling only, since the taxonomy is grammar-constrained).
 - **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>` for
   grammar-constrained decoding. `options.num_ctx` is set explicitly (default 8192)
   and `num_predict` capped (default 768) — Ollama's small default context would
-  otherwise silently truncate the taxonomy+few-shot prompt. Retries: 2 attempts
+  otherwise silently truncate the taxonomy prompt. Retries: 2 attempts
   (3 total) with exponential backoff (200 ms ×4, jitter), connect timeout 3 s,
   total timeout 30 s per attempt; `keep_alive: "10m"` avoids model unload between
   calls. On 503 the API responds with `Retry-After: 5`.
@@ -92,7 +92,8 @@ Client ──HTTP──▶    │ axum server (REST, /v1/…)               │
   position in the response array** (the model may echo ids, but ids are never
   trusted for association); verifies each label ∈ taxonomy enum (canonical ASCII
   slugs, case-insensitive); invalid/missing entries are retried once individually,
-  then fall back to `unknown`.
+  then fall back to `other_expense`/`other_income` with `status: fallback_unknown`
+  (ADR-004).
 
 ## API
 
@@ -103,9 +104,10 @@ Errors use a uniform body:
 ```
 
 Status codes: `400` malformed/invalid input (unknown language code, empty
-`transactions`, duplicate `id`s, non-finite amounts), `413` batch too large,
-`503` LLM backend unreachable/overloaded (with `Retry-After: 5`), `504` per-item
-LLM timeout exhausted (batch degrades item-wise, never wholesale).
+`transactions`, duplicate `id`s, non-finite amounts, over-long fields), `413`
+batch too large, `503` LLM backend unreachable/overloaded (with `Retry-After:
+5`). LLM timeouts never produce 504 — they degrade item-wise to fallback
+(see ADR-004).
 
 `POST /v1/label`
 
@@ -141,11 +143,12 @@ Response:
 }
 ```
 
-`category` is the **canonical slug** (stable across languages, ASCII) — it is the
-model-facing enum value and the API identifier. `category_label` is the localized
-display name for the requested language; clients must key on `category`, not the
-label. `status` is `ok` or `fallback_unknown` (taxonomy retry failed for that item);
-a batch never fails wholesale because of individual items.
+`category` is the **canonical slug** (stable across languages, ASCII) — it is
+the model-facing enum value and the API identifier. `category_label` is the
+localized display name for the requested language; clients must key on
+`category`, not the label. `status` is `ok` or `fallback_unknown` (taxonomy
+retry failed for that item → labelled `other_expense`/`other_income`); a batch
+never fails wholesale because of individual items.
 
 `POST /v1/label:batch` — same, with `"transactions": [...]` (max 100 per request;
 larger batches must be chunked client-side — a sync request must complete within
@@ -167,6 +170,10 @@ income category. The LLM only classifies the *category* within that direction.
 | `TL_CONCURRENCY` | `4` | Parallel LLM requests (client-side semaphore) |
 | `TL_MICRO_BATCH` | `8` | Transactions per prompt |
 | `TL_NUM_CTX` | `8192` | Ollama `options.num_ctx` per request |
+| `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
+| `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
+| `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
+| `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
 | `TL_TAXONOMY` | built-in | Path to JSON taxonomy override |
 
@@ -187,8 +194,11 @@ parentheses):
 - Income: `salary_income` (Einkommen), `refund` (Erstattung), `transfer` (Übertragung), `other_income` (Sonstige Einnahmen)
 - Expense: `housing` (Wohnen), `groceries` (Lebensmittel), `dining` (Restaurant & Café), `transport` (Transport & Mobilität), `shopping` (Shopping), `health` (Gesundheit), `leisure` (Freizeit & Unterhaltung), `subscriptions` (Abos & Dienstleistungen), `insurance` (Versicherungen), `savings_investing` (Sparen & Investieren), `education` (Bildung), `donations` (Spenden), `taxes_fees` (Steuern & Gebühren), `cash_withdrawal` (Bargeld), `credit_card_settlement` (Kreditkartenabrechnung), `transfer` (Übertragung), `other_expense` (Sonstige Ausgaben)
 
-`unknown` is added automatically as an escape hatch for both directions. Custom
-taxonomies can be provided via `TL_TAXONOMY` JSON file with per-language names.
+Every taxonomy must provide a generic fallback category for both directions
+(`other_income`/`other_expense`, or any slug containing `other` with the right
+direction); startup fails otherwise. Custom taxonomies can be provided via
+`TL_TAXONOMY` JSON file with per-language names and an explicit per-category
+`direction` (income|expense).
 
 ### VRAM budget enforcement
 
@@ -221,15 +231,17 @@ documented as an advanced option, not a default.
 4. **Live evaluation harness** (`--ignored` test, requires running Ollama):
    `cargo test -- --ignored live_eval` runs the golden set against the real model
    with `temperature = 0` and a pinned model tag, reports per-category recall and a
-   confusion matrix; asserted macro accuracy ≥ 0.8 with ≥ 2 samples per category.
-   Skipped by default so CI needs no GPU.
+   confusion list; asserted macro accuracy ≥ 0.8 (measured 0.90 on the bundled
+   set with `qwen3.5:4b`, stable across runs at temperature 0). Some categories
+   have a single sample; the set is a smoke eval, not a benchmark. Skipped by
+   default so CI needs no GPU.
 5. **Language-switch end-to-end test**: same request with `language: de` vs `en`
    must yield identical `category` slugs and different `category_label`s.
-6. **Property tests**: validator never returns a label outside the taxonomy;
-   parser handles arbitrary whitespace/markdown-fenced JSON.
-7. **Batch load test**: 100-transaction request against the mock with per-call
-   delay asserts bounded concurrency (≤ `TL_CONCURRENCY` in flight) and item-wise
-   fallback for failing items.
+ 6. **Parser robustness tests**: markdown-fenced JSON, surrounding prose,
+    brace-in-string, duplicate entries, out-of-range indices, garbage output.
+ 7. **Batch load test**: batch requests against the mock with per-call
+    delay assert bounded concurrency (≤ `TL_CONCURRENCY` in flight) and item-wise
+    fallback for failing items.
 
 ## Git flow
 
@@ -239,12 +251,12 @@ documented as an advanced option, not a default.
 ## Dependencies
 
 axum, tokio, reqwest (rustls), serde/serde_json, tracing/tracing-subscriber,
-thiserror, jsonschema (schema validation of custom taxonomies in tests).
+thiserror, futures, rand.
 
 ## Risks & mitigations
 
 - **Model hallucinates label outside taxonomy** → constrained decoding (schema
-  `format`) + post-validation + retry + `unknown` fallback.
+  `format`) + post-validation + retry + fallback to `other_income`/`other_expense`.
 - **Ollama unavailable** → `/v1/health` reports degraded; batch returns 503 with
   structured error and `Retry-After`.
 - **Slow model** → micro-batching (fewer calls), semaphore concurrency, per-attempt
@@ -253,6 +265,6 @@ thiserror, jsonschema (schema validation of custom taxonomies in tests).
 
 ## Observability
 
-`tracing` structured logs with request IDs; per-request log line includes model,
-prompt item count, latency, fallback count. Startup logs the resolved config, VRAM
+`tracing` structured logs; per-batch log line includes item count, fallback
+count, and latency. (Request-ID middleware is future work.) Startup logs the resolved config, VRAM
 check result, and taxonomy size. `/v1/health` reports backend reachability.

@@ -17,19 +17,15 @@ pub struct LlmRequest {
     pub include_rationale: bool,
 }
 
-/// Raw parsed model output: results keyed by input position.
+/// Raw parsed model output: slot `k` of the parsed vector corresponds to the
+/// k-th input transaction (positional association); the model-echoed index is
+/// not used for mapping.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // `index` kept for debugging/logging of raw output
 pub struct RawClassification {
     pub index: usize,
     pub category: String,
     pub rationale: Option<String>,
-}
-
-impl RawClassification {
-    #[allow(dead_code)]
-    pub fn index(&self) -> usize {
-        self.index
-    }
 }
 
 #[derive(Error, Debug, Clone)]
@@ -78,7 +74,7 @@ struct ChatRequestBody {
 }
 
 impl OllamaClient {
-    pub fn new(cfg: &Config, taxonomy: Taxonomy, _slugs: Vec<String>) -> Self {
+    pub fn new(cfg: &Config, taxonomy: Taxonomy) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .build()

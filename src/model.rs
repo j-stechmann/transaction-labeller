@@ -24,7 +24,6 @@ impl Direction {
         }
     }
 
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Direction::Income => "income",
@@ -134,12 +133,6 @@ impl ApiError {
                 details: Vec::new(),
             },
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_details(mut self, details: Vec<String>) -> Self {
-        self.error.details = details;
-        self
     }
 
     pub fn invalid_request(msg: impl Into<String>) -> Self {

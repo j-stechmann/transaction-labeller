@@ -25,7 +25,6 @@ pub struct LabelBatchRequest {
 pub struct ApiState {
     pub service: Arc<LabelService>,
     pub max_batch: usize,
-    #[allow(dead_code)]
     pub max_field_len: usize,
 }
 
@@ -229,6 +228,8 @@ pub async fn taxonomy(
 ) -> Response {
     let lang = q
         .language
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
         .unwrap_or_else(|| state.service.default_language.clone());
     if lang.len() != 2 || !lang.chars().all(|c| c.is_ascii_alphabetic()) {
         return api_err(

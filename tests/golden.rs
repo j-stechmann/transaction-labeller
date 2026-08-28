@@ -95,11 +95,13 @@ async fn golden_pipeline_preserves_contract() {
             result["direction"], expected.direction,
             "case {name}: direction mismatch"
         );
-        // The mock maps by keyword; assert the category is *within the
-        // taxonomy*, consistent with its declared direction, and matches the
-        // expected direction. Exact category match against the mock's keyword
-        // proxy is checked where the keyword is unambiguous; the authoritative
-        // result-correctness check is the live eval.
+        // Exact category match: the mock's keyword map is the deterministic
+        // ground truth for this set. Any cross-item mis-mapping, ordering
+        // bug, or validation regression fails here.
+        assert_eq!(
+            result["category"], expected.category,
+            "case {name}: category mismatch (positional association broken?)"
+        );
         let slug = result["category"].as_str().unwrap();
         let cat = taxonomy
             .lookup(slug)
