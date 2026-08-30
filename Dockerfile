@@ -1,5 +1,5 @@
 # ---- deps: build dependency cache layer ----
-FROM rust:1-slim-bookworm AS deps
+FROM rust:1-slim-bookworm@sha256:1469a27c125cb5a3aebfa4f4e4665d935b02fb72cc093b2c974b3d740e43f157 AS deps
 WORKDIR /build
 # curl/unzip: utoipa-swagger-ui downloads the Swagger UI bundle at build time
 RUN apt-get update \
@@ -18,7 +18,7 @@ RUN if [ -z "$SKIP_TESTS" ]; then cargo test --locked --all-features; else echo 
 RUN cargo build --release --locked
 
 # ---- runtime: minimal image ----
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/j-stechmann/transaction-labeller"
 LABEL org.opencontainers.image.description="Local LLM-based REST service that labels bank transactions with dynamically generated category names"
 LABEL org.opencontainers.image.licenses="MIT"
