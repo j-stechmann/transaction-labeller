@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::model::Transaction;
 use crate::prompt;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -249,7 +249,7 @@ impl OllamaClient {
 
 fn backoff_delay(attempt: u32) -> Duration {
     let base_ms = 200u64.saturating_mul(4u64.saturating_pow(attempt.saturating_sub(1)));
-    let jitter = rand::thread_rng().gen_range(0..=base_ms / 4);
+    let jitter = rand::rng().random_range(0..=base_ms / 4);
     Duration::from_millis(base_ms + jitter)
 }
 
