@@ -22,13 +22,13 @@ impl Default for Config {
         Self {
             bind_addr: "127.0.0.1:8080".to_string(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
-            model: "qwen3.5:4b".to_string(),
+            model: "qwen3.8:27b-q4_K_M".to_string(),
             language: "de".to_string(),
-            concurrency: 4,
-            micro_batch: 8,
-            num_ctx: 8192,
+            concurrency: 1,
+            micro_batch: 16,
+            num_ctx: 4096,
             vram_budget_mb: 8192,
-            request_timeout_secs: 30,
+            request_timeout_secs: 600,
             max_retries: 2,
             max_batch: 100,
             label_library: "labels.json".to_string(),
@@ -153,16 +153,19 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let cfg = Config::default();
-        assert_eq!(cfg.model, "qwen3.5:4b");
-        assert_eq!(cfg.concurrency, 4);
-        assert_eq!(cfg.micro_batch, 8);
-        assert_eq!(cfg.num_ctx, 8192);
+        assert_eq!(cfg.model, "qwen3.8:27b-q4_K_M");
+        assert_eq!(cfg.concurrency, 1);
+        assert_eq!(cfg.micro_batch, 16);
+        assert_eq!(cfg.num_ctx, 4096);
         assert_eq!(cfg.language, "de");
         assert_eq!(cfg.label_library, "labels.json");
         assert_eq!(cfg.library_prompt_max, 200);
-        // 4B model at Q4 (~3.4GB) + KV + overhead must fit 8GB budget
+        // Hybrid CPU+GPU inference: the 27B model (18 GB at Q4_K_M) cannot fit
+        // into the 8 GB VRAM budget, so the advisory check is expected to warn.
         assert!(cfg.vram_budget_mb >= 8192);
-        assert!(cfg.request_timeout_secs >= 10);
+        // Hybrid decode is slow (~3-5 tok/s); each attempt needs a generous
+        // timeout or every call degrades to the fallback label.
+        assert!(cfg.request_timeout_secs >= 600);
     }
 
     #[test]

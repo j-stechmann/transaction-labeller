@@ -4,8 +4,8 @@ A Rust REST service that labels bank transactions with **category names
 generated dynamically by an LLM**, served locally via Ollama. The client
 receives **only the label** — no fixed taxonomy, no slugs. A **label library**
 (a plain JSON file of already-used labels) is injected into every prompt so
-the model reuses established wording instead of drifting. 8 GB VRAM budget on
-an RTX 3070 Ti; no cloud inference.
+the model reuses established wording instead of drifting. RTX 3070 Ti (8 GB
+VRAM) + Ryzen 5600X + 32 GB RAM; hybrid CPU+GPU inference; no cloud.
 
 ## Goals
 
@@ -13,7 +13,7 @@ an RTX 3070 Ti; no cloud inference.
 - Reuse existing label wording (label library) instead of inventing variants
 - Response contains nothing but the label
 - Parallel processing with bounded concurrency
-- Local inference within 8 GB VRAM
+- Local inference (hybrid CPU+GPU; 8 GB VRAM + 32 GB RAM)
 
 ## Non-goals
 
@@ -24,14 +24,21 @@ an RTX 3070 Ti; no cloud inference.
 
 ## Model selection (research summary)
 
-Decision and full comparison in ADR-001. Default: **`qwen3.5:4b`**
-(Ollama, Q4_K_M, ~3.4 GB, Apache-2.0). Key facts:
+Decision and full comparison in ADR-001 (original pick) and **ADR-010**
+(current default). Default: **`qwen3.8:27b-q4_K_M`** (Ollama, Q4_K_M,
+~18 GB, Apache-2.0) in **hybrid CPU+GPU mode** — accuracy outranks latency.
+Key facts:
 
-- 201 languages (incl. German — the primary data is a German bank export)
-- IFEval 89.8 (instruction following), strong structured-output accuracy
-- ~3.4 GB weights → >4.5 GB headroom for KV cache + concurrency on 8 GB
-- Must be called with `think: false` (thinking mode exhausts `num_predict`
-  before emitting content — discovered via live eval)
+- The qwen3.8 family ships only as 27B (no smaller variants exist)
+- Thinking + vision model; thinking disabled per request via `think: false`
+  (thinking mode exhausts `num_predict` before emitting content — discovered
+  via live eval)
+- Hybrid config: `TL_CONCURRENCY=1`, `TL_MICRO_BATCH=16`, `TL_NUM_CTX=4096`,
+  `TL_REQUEST_TIMEOUT_SECS=600`; Ollama-side `OLLAMA_NUM_PARALLEL=1`,
+  `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_FLASH_ATTENTION=1`,
+  `OLLAMA_KV_CACHE_TYPE=q8_0`
+- Fast profile (documented alternative): `qwen3.5:4b`, GPU-only, ~3.4 GB,
+  measured 1.00 on the golden eval
 
 ## Architecture
 
@@ -141,33 +148,38 @@ sees the signed amount.
 |---|---|---|
 | `TL_BIND_ADDR` | `127.0.0.1:8080` | HTTP bind (loopback assumed; warning if non-loopback — no auth implemented) |
 | `TL_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama base |
-| `TL_MODEL` | `qwen3.5:4b` | Model tag |
+| `TL_MODEL` | `qwen3.8:27b-q4_K_M` | Model tag (hybrid CPU+GPU; see ADR-010) |
 | `TL_LANGUAGE` | `de` | Label language (ISO 639-1); request `options.language` overrides |
-| `TL_CONCURRENCY` | `4` | Parallel LLM requests (client-side semaphore) |
-| `TL_MICRO_BATCH` | `8` | Transactions per prompt |
-| `TL_NUM_CTX` | `8192` | Ollama `options.num_ctx` per request |
+| `TL_CONCURRENCY` | `1` | Parallel LLM requests (client-side semaphore) |
+| `TL_MICRO_BATCH` | `16` | Transactions per prompt |
+| `TL_NUM_CTX` | `4096` | Ollama `options.num_ctx` per request |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file; empty disables the library |
 | `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels injected per prompt; `0` disables the library entirely |
-| `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
+| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
-| `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
+| `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget (keep off in hybrid mode) |
 
 Language precedence: `options.language` > `TL_LANGUAGE`.
 
-**Ollama-side parallelism**: real parallelism requires `OLLAMA_NUM_PARALLEL`
-(e.g. 4) and `OLLAMA_MAX_LOADED_MODELS` on the Ollama server; otherwise
-`TL_CONCURRENCY` requests queue inside Ollama. Documented in README;
-`keep_alive` set per request.
+**Ollama-side parallelism**: the hybrid default runs one request at a time
+(`OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`, flash attention on,
+q8_0 KV cache). The fast profile benefits from `OLLAMA_NUM_PARALLEL=4`;
+otherwise `TL_CONCURRENCY` requests queue inside Ollama. Documented in
+README; `keep_alive` set per request.
 
-### VRAM budget
+### VRAM / hybrid budget
 
-KV-cache math: Qwen3.5-4B KV is small (GQA, 4 KV heads, partial attention);
-at `num_ctx=8192`, fp16 KV ≈ 50–80 MB per request — 4 concurrent requests ≈
-≤ 320 MB. Weights 3.4 GB + KV + CUDA context/driver (~500 MB) +
-desktop/compositor reserve (~300 MB if present) ≈ **~4.6 GB worst case**,
-well within 8 GB.
+The 27B Q4_K_M weights (~18 GB) exceed the 8 GB VRAM budget by design:
+Ollama offloads most layers to system RAM (hybrid CPU+GPU) — on an 8 GB
+card roughly ~30/66 layers stay on GPU, the rest in RAM (~3–5 tok/s decode
+on a 5600X). KV-cache at `num_ctx=4096` with q8_0 KV and 1 request ≈ 50–100
+MB. The startup advisory check warns that weights exceed 80 % of the budget
+— this warning is expected for the default model; `TL_STRICT_VRAM` must
+stay off. The fast profile (`qwen3.5:4b`) fits fully in VRAM: 3.4 GB
+weights + ≤ ~320 MB KV (4 × 8192 ctx) + ~800 MB CUDA/driver ≈ 4.6 GB worst
+case.
 
 Advisory check at startup: query Ollama `/api/tags` for the model's `size`;
 warn (exit non-zero with `TL_STRICT_VRAM`) if weights exceed
@@ -191,11 +203,14 @@ warn (exit non-zero with `TL_STRICT_VRAM`) if weights exceed
    transactions (German, English) through the pipeline against the mock;
    exact positional/label/id assertions.
 4. **Live evaluation harness** (`--ignored`, requires running Ollama):
-   the whole set labelled in **one request** (dynamic labels are
+    the whole set labelled in **one request** (dynamic labels are
    batch-consistent, so single-batch is the honest evaluation); each case
    lists semantically acceptable labels and the produced label must match
-   one. Measured **1.00** with `qwen3.5:4b`, stable across runs at
-   temperature 0. Asserts ≥ 0.8; skipped by default so CI needs no GPU.
+   one. Asserts ≥ 0.8; skipped by default so CI needs no GPU. Measured on
+   the dev box (5070 Ti 16 GB; accuracy carries over, wall time does not):
+   qwen3.8:27b hybrid **0.95** (~33 s), qwen3.5:4b GPU 0.90 (~4 s) on the
+   no-library protocol — ADR-010. The 4B measured 1.00 under the ADR-006
+   protocol with the library injected.
 5. **Parser robustness tests**: markdown-fenced JSON, surrounding prose,
    brace-in-string, duplicate entries, out-of-range indices, garbage output.
 
@@ -225,8 +240,13 @@ thiserror, futures, rand, utoipa + utoipa-swagger-ui (OpenAPI docs).
 - **Ollama unavailable** → `/v1/health` reports degraded; requests return 503
   with structured error and `Retry-After`.
 - **Slow model** → micro-batching, semaphore concurrency, per-attempt
-  timeout (30 s), 2 retries with backoff; timeouts degrade item-wise.
-- **VRAM overflow** → startup check vs budget; default model chosen at 3.4 GB.
+  timeout (600 s for the hybrid default), 2 retries with backoff; timeouts
+  degrade item-wise.
+- **Hybrid latency** → on the 8 GB target (~30/66 layers on GPU) the 27B
+  decodes at ~3–5 tok/s; a 100-tx batch takes ~15–25 min with library
+  prefill. Accepted (ADR-010); use the fast profile when latency matters.
+- **VRAM overflow** → startup check vs budget; default model is hybrid by
+  design (warning expected).
 
 ## Observability
 
