@@ -356,8 +356,12 @@ Config defaults change to match hybrid reality:
 |---|---|---|---|
 | `TL_CONCURRENCY` | 4 | **1** | hybrid decode cannot parallelize; parallel requests would thrash |
 | `TL_MICRO_BATCH` | 8 | **16** | amortize the library prefill over more transactions |
-| `TL_NUM_CTX` | 8192 | **4096** | prompt ≈ 2.5k tokens; halves CPU-side KV cache |
+| `TL_NUM_CTX` | 8192 | **8192** (kept) | worst-case prompt (200-label library + 16 tx with 512-byte fields ≈ 6–9k tokens) would exceed 4096 → Ollama truncates silently; the q8_0 KV-cache saving at 4096 is only ~50–100 MB |
 | `TL_REQUEST_TIMEOUT_SECS` | 30 | **600** | hybrid decode ≈ 3–5 tok/s; 30 s timed out every call → mass fallback |
+
+The `TL_REQUEST_TIMEOUT_SECS` env cap is 3600 s — deliberately above the
+600 s default, so operators on slower hardware (fewer GPU layers → slower
+decode) can raise it instead of failing config validation.
 
 The VRAM advisory check now warns for the default model by design (18 GB
 weights > 80 % of the 8 GB budget); the warning is annotated as expected for

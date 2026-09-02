@@ -1,3 +1,8 @@
+/// Model tag of the documented default (ADR-010, hybrid CPU+GPU). The VRAM
+/// advisory distinguishes it from non-default models, whose budget warnings
+/// are not "expected".
+pub const DEFAULT_MODEL: &str = "qwen3.8:27b-q4_K_M";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -22,11 +27,11 @@ impl Default for Config {
         Self {
             bind_addr: "127.0.0.1:8080".to_string(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
-            model: "qwen3.8:27b-q4_K_M".to_string(),
+            model: DEFAULT_MODEL.to_string(),
             language: "de".to_string(),
             concurrency: 1,
             micro_batch: 16,
-            num_ctx: 4096,
+            num_ctx: 8192,
             vram_budget_mb: 8192,
             request_timeout_secs: 600,
             max_retries: 2,
@@ -94,7 +99,7 @@ impl Config {
         }
         if let Ok(v) = std::env::var("TL_REQUEST_TIMEOUT_SECS") {
             cfg.request_timeout_secs =
-                parse_usize("TL_REQUEST_TIMEOUT_SECS", &v, Some(1), Some(600))? as u64;
+                parse_usize("TL_REQUEST_TIMEOUT_SECS", &v, Some(1), Some(3600))? as u64;
         }
         if let Ok(v) = std::env::var("TL_MAX_RETRIES") {
             cfg.max_retries = parse_usize("TL_MAX_RETRIES", &v, Some(0), Some(10))? as u32;
@@ -156,7 +161,7 @@ mod tests {
         assert_eq!(cfg.model, "qwen3.8:27b-q4_K_M");
         assert_eq!(cfg.concurrency, 1);
         assert_eq!(cfg.micro_batch, 16);
-        assert_eq!(cfg.num_ctx, 4096);
+        assert_eq!(cfg.num_ctx, 8192);
         assert_eq!(cfg.language, "de");
         assert_eq!(cfg.label_library, "labels.json");
         assert_eq!(cfg.library_prompt_max, 200);
@@ -166,6 +171,32 @@ mod tests {
         // Hybrid decode is slow (~3-5 tok/s); each attempt needs a generous
         // timeout or every call degrades to the fallback label.
         assert!(cfg.request_timeout_secs >= 600);
+    }
+
+    #[test]
+    fn timeout_and_ctx_env_bounds() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        struct Cleanup(&'static [&'static str]);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for var in self.0 {
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+        let _cleanup = Cleanup(&["TL_REQUEST_TIMEOUT_SECS", "TL_NUM_CTX"]);
+        unsafe {
+            std::env::set_var("TL_REQUEST_TIMEOUT_SECS", "3600");
+            std::env::set_var("TL_NUM_CTX", "16384");
+        }
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.request_timeout_secs, 3600);
+        assert_eq!(cfg.num_ctx, 16384);
+        // The cap is above the default so slower hardware can raise it.
+        unsafe {
+            std::env::set_var("TL_REQUEST_TIMEOUT_SECS", "3601");
+        }
+        assert!(Config::from_env().is_err());
     }
 
     #[test]

@@ -71,7 +71,10 @@ Amazon Prime SEPA debit); the 4B misses are semantic errors.
   advisory therefore warns — this is expected in hybrid mode
   (`TL_STRICT_VRAM` must stay off).
 - Keep other GPU-heavy services in mind: free VRAM determines how many
-  layers stay on the 3070 Ti and thus the decode speed.
+  layers stay on the 3070 Ti and thus the decode speed. If batches still
+  time out (each attempt is 600 s by default, raiseable to 3600 via
+  `TL_REQUEST_TIMEOUT_SECS`), timed-out micro-batches degrade item-wise and
+  a 100-tx batch can take much longer than the 15–25 min estimate.
 
 ## Quick start
 
@@ -192,11 +195,11 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 | `TL_LANGUAGE` | `de` | Default label language (ISO 639-1) |
 | `TL_CONCURRENCY` | `1` | Max parallel LLM requests |
 | `TL_MICRO_BATCH` | `16` | Transactions per prompt |
-| `TL_NUM_CTX` | `4096` | Ollama `num_ctx` (prompt window) |
+| `TL_NUM_CTX` | `8192` | Ollama `num_ctx` (prompt window) |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file (empty = disabled) |
 | `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels shown per prompt (`0` disables the library entirely) |
-| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout |
+| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout (max 3600) |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory VRAM budget |
 | `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
@@ -210,9 +213,10 @@ TL_REQUEST_TIMEOUT_SECS=30 cargo run --release
 
 VRAM math (default config, hybrid): the 27B Q4_K_M weights (~18 GB) cannot
 fit in 8 GB VRAM — Ollama places ~30/66 layers on the 3070 Ti and the rest
-in system RAM (~3–5 tok/s decode). KV cache at `num_ctx=4096`, q8_0, 1
-request ≈ ~50–100 MB. The startup advisory warns that the model exceeds the
-VRAM budget — expected in hybrid mode.
+in system RAM (~3–5 tok/s decode). KV cache at `num_ctx=8192`, q8_0, 1
+request ≈ ~100–200 MB. The startup advisory warns that the model exceeds the
+VRAM budget — expected in hybrid mode (only for the default model; a
+different `TL_MODEL` warning should be investigated).
 
 ## Label language
 

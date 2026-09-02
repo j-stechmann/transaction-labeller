@@ -33,7 +33,7 @@ Key facts:
 - Thinking + vision model; thinking disabled per request via `think: false`
   (thinking mode exhausts `num_predict` before emitting content — discovered
   via live eval)
-- Hybrid config: `TL_CONCURRENCY=1`, `TL_MICRO_BATCH=16`, `TL_NUM_CTX=4096`,
+- Hybrid config: `TL_CONCURRENCY=1`, `TL_MICRO_BATCH=16`, `TL_NUM_CTX=8192`,
   `TL_REQUEST_TIMEOUT_SECS=600`; Ollama-side `OLLAMA_NUM_PARALLEL=1`,
   `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_FLASH_ATTENTION=1`,
   `OLLAMA_KV_CACHE_TYPE=q8_0`
@@ -75,7 +75,8 @@ Client ──HTTP──▶     │ axum server (REST, /v1/…, Swagger UI)   │
 - **LLM client**: HTTP to Ollama `/api/chat` with `format: <json schema>`
   (grammar-constrained: `results[].{index,label}`, label 1–64
   chars — no enum, labels are free-form). `num_ctx` explicit (default 8192),
-  `num_predict` capped (768), `temperature` 0, `think` false,
+  `num_predict` capped (1024 — fits a 16-item batch of up-to-64-char labels),
+  `temperature` 0, `think` false,
   `keep_alive: "10m"`. Retries: 2 attempts (3 total) with exponential backoff
   + jitter, connect timeout 3 s, total timeout 30 s per attempt; 429 and 5xx
   are transient; timeouts degrade item-wise. On 503 the API responds with
@@ -152,11 +153,11 @@ sees the signed amount.
 | `TL_LANGUAGE` | `de` | Label language (ISO 639-1); request `options.language` overrides |
 | `TL_CONCURRENCY` | `1` | Parallel LLM requests (client-side semaphore) |
 | `TL_MICRO_BATCH` | `16` | Transactions per prompt |
-| `TL_NUM_CTX` | `4096` | Ollama `options.num_ctx` per request |
+| `TL_NUM_CTX` | `8192` | Ollama `options.num_ctx` per request |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request (413 above) |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file; empty disables the library |
 | `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels injected per prompt; `0` disables the library entirely |
-| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout |
+| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout (env cap 3600) |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory; logged + checked vs model size |
 | `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget (keep off in hybrid mode) |
@@ -174,7 +175,7 @@ README; `keep_alive` set per request.
 The 27B Q4_K_M weights (~18 GB) exceed the 8 GB VRAM budget by design:
 Ollama offloads most layers to system RAM (hybrid CPU+GPU) — on an 8 GB
 card roughly ~30/66 layers stay on GPU, the rest in RAM (~3–5 tok/s decode
-on a 5600X). KV-cache at `num_ctx=4096` with q8_0 KV and 1 request ≈ 50–100
+on a 5600X). KV-cache at `num_ctx=8192` with q8_0 KV and 1 request ≈ 100–200
 MB. The startup advisory check warns that weights exceed 80 % of the budget
 — this warning is expected for the default model; `TL_STRICT_VRAM` must
 stay off. The fast profile (`qwen3.5:4b`) fits fully in VRAM: 3.4 GB
@@ -240,8 +241,8 @@ thiserror, futures, rand, utoipa + utoipa-swagger-ui (OpenAPI docs).
 - **Ollama unavailable** → `/v1/health` reports degraded; requests return 503
   with structured error and `Retry-After`.
 - **Slow model** → micro-batching, semaphore concurrency, per-attempt
-  timeout (600 s for the hybrid default), 2 retries with backoff; timeouts
-  degrade item-wise.
+   timeout (600 s default for the hybrid model, env cap 3600 s), 2 retries
+   with backoff; timeouts degrade item-wise.
 - **Hybrid latency** → on the 8 GB target (~30/66 layers on GPU) the 27B
   decodes at ~3–5 tok/s; a 100-tx batch takes ~15–25 min with library
   prefill. Accepted (ADR-010); use the fast profile when latency matters.

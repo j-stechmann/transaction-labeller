@@ -308,7 +308,11 @@ pub async fn vram_check_service(
                 } else {
                     // Expected for the default hybrid model (27B Q4_K_M, 18 GB):
                     // Ollama offloads most layers to system RAM. Keep TL_STRICT_VRAM off.
-                    tracing::warn!("{msg} (hybrid CPU+GPU inference — this warning is expected for the default model)");
+                    if service.client().model() == crate::config::DEFAULT_MODEL {
+                        tracing::warn!("{msg} (hybrid CPU+GPU inference — this warning is expected for the default model)");
+                    } else {
+                        tracing::warn!("{msg}");
+                    }
                     Ok(())
                 }
             } else {

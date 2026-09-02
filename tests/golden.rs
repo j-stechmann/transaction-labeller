@@ -57,6 +57,20 @@ fn load_golden() -> Vec<GoldenCase> {
     serde_json::from_str(raw).expect("golden cases must parse")
 }
 
+/// Live-eval model override (`TL_MODEL=qwen3.5:4b` for the fast GPU profile),
+/// validated like `Config::from_env` would (trim + non-empty) so an empty or
+/// whitespace value fails loudly here instead of reaching Ollama as `""`.
+fn model_from_env() -> String {
+    match std::env::var("TL_MODEL") {
+        Ok(v) => {
+            let v = v.trim().to_string();
+            assert!(!v.is_empty(), "TL_MODEL must not be empty");
+            v
+        }
+        Err(_) => Config::default().model,
+    }
+}
+
 async fn run_through_pipeline(
     cases: &[GoldenCase],
     ollama_url: &str,
@@ -66,9 +80,7 @@ async fn run_through_pipeline(
         ollama_url: ollama_url.to_string(),
         micro_batch,
         concurrency: 1,
-        // Live eval override: compare models without recompiling
-        // (TL_MODEL=qwen3.5:4b for the fast GPU profile).
-        model: std::env::var("TL_MODEL").unwrap_or_else(|_| Config::default().model),
+        model: model_from_env(),
         // Keep golden runs hermetic: no label-library file is read or written.
         label_library: String::new(),
         ..Config::default()
