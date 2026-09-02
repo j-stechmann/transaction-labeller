@@ -78,7 +78,8 @@ Client ──HTTP──▶     │ axum server (REST, /v1/…, Swagger UI)   │
   `num_predict` capped (1024 — fits a 16-item batch of up-to-64-char labels),
   `temperature` 0, `think` false,
   `keep_alive: "10m"`. Retries: 2 attempts (3 total) with exponential backoff
-  + jitter, connect timeout 3 s, total timeout 30 s per attempt; 429 and 5xx
+  + jitter, connect timeout 3 s, total timeout 600 s per attempt
+  (`TL_REQUEST_TIMEOUT_SECS`, env cap 3600 s); 429 and 5xx
   are transient; timeouts degrade item-wise. On 503 the API responds with
   `Retry-After: 5`.
 - **Label sanitizer**: labels are free model output — trimmed, whitespace
