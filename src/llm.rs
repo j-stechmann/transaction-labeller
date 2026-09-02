@@ -87,6 +87,11 @@ impl OllamaClient {
         }
     }
 
+    /// Configured model tag (for the VRAM advisory's default-model check).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Liveness/model reachability probe.
     pub async fn health(&self) -> Result<(), LlmError> {
         let url = format!("{}/api/tags", self.base_url);
@@ -167,7 +172,9 @@ impl OllamaClient {
             options: json!({
                 "num_ctx": self.num_ctx,
                 "temperature": 0.0,
-                "num_predict": 768,
+                // 16-item micro-batch of up-to-64-char labels: ~1k tokens worst
+                // case; 768 truncated mid-JSON and forced per-item retries.
+                "num_predict": 1024,
             }),
         };
 

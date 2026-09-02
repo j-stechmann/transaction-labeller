@@ -32,36 +32,62 @@ Client ──HTTP──▶ axum REST API ──▶ pipeline (chunk → parallel 
   within a batch
 - **Configurable label language** per request (`options.language`, ISO 639-1)
   or server-wide (`TL_LANGUAGE`)
-- **8 GB VRAM aware**: startup advisory check against the Ollama model list;
-  default model `qwen3.5:4b` uses ~3.4 GB
+- **Accuracy-first default**: `qwen3.8:27b-q4_K_M` in hybrid CPU+GPU mode
+  (~18 GB weights: part on the 3070 Ti, rest in system RAM); a fast
+  GPU-only profile (`qwen3.5:4b`) remains one env override away
 
 ## Model choice
 
 | | |
 |---|---|
-| **Default** | `qwen3.5:4b` (Q4_K_M, ~3.4 GB) |
-| Why | 201 languages incl. German; IFEval 89.8 (instruction following); strong structured-output accuracy; Apache-2.0 |
-| Alternatives | `gemma4:12b` (better raw quality, 7.6 GB — no concurrency headroom), `qwen3:8b` (thinking model, 5.2 GB), `qwen3.5:9b` (6.6 GB, tight) |
+| **Default** | `qwen3.8:27b-q4_K_M` (Q4_K_M, ~18 GB, hybrid CPU+GPU) |
+| Why | Accuracy-first: only qwen3.8 size is 27B; 256K context, strong multilingual + instruction following; Apache-2.0. Hybrid mode trades latency (≈ 1–2 min per micro-batch) for quality — accepted. |
+| Fast profile | `qwen3.5:4b` (Q4_K_M, ~3.4 GB, GPU-only): seconds per batch, measured 1.00 on the golden eval. `TL_MODEL=qwen3.5:4b TL_CONCURRENCY=4 TL_MICRO_BATCH=8 TL_NUM_CTX=8192 TL_REQUEST_TIMEOUT_SECS=30` |
+| Rejected | `27b-q8_0` (30 GB, ~½ speed, no accuracy gain), `27b-bf16` (56 GB, does not fit), all `-mlx`/`-mxfp8`/`-nvfp4` tags (macOS only) |
 
 Measured on the bundled golden set (20 real-world-style German/English
-transactions, temperature 0, one batch): **1.00 label accuracy** against
-semantic acceptability sets — stable across runs
-(`cargo test -- --ignored live_eval --nocapture`).
+transactions, temperature 0, one batch, no label library) — `cargo test --
+--ignored live_eval --nocapture`. Accuracy carries over to the 8 GB target;
+wall times below are from the dev box (5070 Ti 16 GB, 49/66 layers on GPU)
+and will be slower on the 3070 Ti (see ADR-010):
 
-> **Note**: `qwen3.5` is a *thinking* model. transaction-labeller sends
+| Model | Accuracy | Stability | Wall time (20 tx) |
+|---|---|---|---|
+| `qwen3.8:27b-q4_K_M` (hybrid) | **0.95** (19/20) | identical across 3 runs | ~33 s |
+| `qwen3.5:4b` (GPU, fast profile) | 0.90 (18/20) | identical across 2 runs | ~4 s |
+
+(The 4B reached 1.00 in earlier runs with the label library injected —
+ADR-006/ADR-010.) The 27B miss is a wording variant ("Streaming" for an
+Amazon Prime SEPA debit); the 4B misses are semantic errors.
+
+> **Note**: both are *thinking* model families. transaction-labeller sends
 > `think: false` — otherwise the model burns its entire output budget on
 > reasoning and never emits the label.
+
+### Hardware notes (3070 Ti 8 GB + 5600X + 32 GB)
+
+- The 27B Q4 does **not** fit in 8 GB VRAM; Ollama offloads most layers to
+  system RAM (~30/66 layers on GPU → ~3–5 tok/s decode). The startup VRAM
+  advisory therefore warns — this is expected in hybrid mode
+  (`TL_STRICT_VRAM` must stay off).
+- Keep other GPU-heavy services in mind: free VRAM determines how many
+  layers stay on the 3070 Ti and thus the decode speed. If batches still
+  time out (each attempt is 600 s by default, raiseable to 3600 via
+  `TL_REQUEST_TIMEOUT_SECS`), timed-out micro-batches degrade item-wise and
+  a 100-tx batch can take much longer than the 15–25 min estimate.
 
 ## Quick start
 
 ```bash
-# 1. Pull the model (3.4 GB)
-ollama pull qwen3.5:4b
+# 1. Pull the model (~18 GB)
+ollama pull qwen3.8:27b-q4_K_M
 
-# 2. Allow real parallelism (optional but recommended)
-#    Otherwise TL_CONCURRENCY requests queue inside Ollama.
-export OLLAMA_NUM_PARALLEL=4
+# 2. Tune the Ollama server for hybrid inference (recommended)
+#    Single request at a time; q8_0 KV cache halves KV memory at ~no loss.
+export OLLAMA_NUM_PARALLEL=1
 export OLLAMA_MAX_LOADED_MODELS=1
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
 systemctl restart ollama   # or restart ollama serve
 
 # 3. Build & run
@@ -165,21 +191,32 @@ Uniform body: `{"error":{"code":"invalid_request|backend_unavailable","message":
 |---|---|---|
 | `TL_BIND_ADDR` | `127.0.0.1:8080` | HTTP bind address |
 | `TL_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama base URL |
-| `TL_MODEL` | `qwen3.5:4b` | Ollama model tag |
+| `TL_MODEL` | `qwen3.8:27b-q4_K_M` | Ollama model tag |
 | `TL_LANGUAGE` | `de` | Default label language (ISO 639-1) |
-| `TL_CONCURRENCY` | `4` | Max parallel LLM requests |
-| `TL_MICRO_BATCH` | `8` | Transactions per prompt |
+| `TL_CONCURRENCY` | `1` | Max parallel LLM requests |
+| `TL_MICRO_BATCH` | `16` | Transactions per prompt |
 | `TL_NUM_CTX` | `8192` | Ollama `num_ctx` (prompt window) |
 | `TL_MAX_BATCH` | `100` | Max transactions per batch request |
 | `TL_LABEL_LIBRARY` | `labels.json` | Label-library JSON file (empty = disabled) |
 | `TL_LIBRARY_PROMPT_MAX` | `200` | Max library labels shown per prompt (`0` disables the library entirely) |
-| `TL_REQUEST_TIMEOUT_SECS` | `30` | Per-attempt LLM timeout |
+| `TL_REQUEST_TIMEOUT_SECS` | `600` | Per-attempt LLM timeout (max 3600) |
 | `TL_MAX_RETRIES` | `2` | Retries for transient LLM failures |
 | `TL_VRAM_BUDGET_MB` | `8192` | Advisory VRAM budget |
 | `TL_STRICT_VRAM` | off | `1`/`true` → exit(3) if model > 80 % of budget |
 
-VRAM math (default config): 3.4 GB weights + ≤ ~320 MB KV cache (4 × 8192 ctx)
-+ ~800 MB CUDA/driver/desktop ≈ **4.6 GB worst case** on an 8 GB card.
+Fast profile (GPU-only, low latency) — override the defaults:
+
+```bash
+TL_MODEL=qwen3.5:4b TL_CONCURRENCY=4 TL_MICRO_BATCH=8 TL_NUM_CTX=8192 \
+TL_REQUEST_TIMEOUT_SECS=30 cargo run --release
+```
+
+VRAM math (default config, hybrid): the 27B Q4_K_M weights (~18 GB) cannot
+fit in 8 GB VRAM — Ollama places ~30/66 layers on the 3070 Ti and the rest
+in system RAM (~3–5 tok/s decode). KV cache at `num_ctx=8192`, q8_0, 1
+request ≈ ~100–200 MB. The startup advisory warns that the model exceeds the
+VRAM budget — expected in hybrid mode (only for the default model; a
+different `TL_MODEL` warning should be investigated).
 
 ## Label language
 
@@ -233,8 +270,8 @@ cargo test -- --ignored live_eval --nocapture  # live eval against real Ollama (
 - **Live eval** (`--ignored`): the whole set labelled in **one request**
   (dynamic labels are batch-consistent, so single-batch is the honest
   evaluation); each case lists semantically acceptable labels, and the
-  produced label must match one of them. Asserts ≥ 0.8 (measured 1.00 with
-  `qwen3.5:4b`, stable across runs at temperature 0).
+  produced label must match one of them. Asserts ≥ 0.8. Measured **1.00**
+  with `qwen3.5:4b`; qwen3.8 hybrid numbers in ADR-010.
 
 ## Operations
 

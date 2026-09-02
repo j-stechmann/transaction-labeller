@@ -325,3 +325,89 @@ A **label library**: a single JSON file (`TL_LABEL_LIBRARY`, default
 - Tests: prompt-injection assertions via captured system prompts in the
   mock; library round-trip/corruption/cap unit tests; `/v1/labels`
   integration coverage.
+
+# ADR-010: Default model — qwen3.8:27b-q4_K_M, hybrid CPU+GPU (amends ADR-001)
+
+Date: 2026-09-02
+Status: Accepted (amends ADR-001; accuracy now outranks latency)
+
+## Context
+
+ADR-001 picked `qwen3.5:4b` when accuracy per second mattered most. The
+requirement changed: **accuracy is now the top priority** and latency is
+explicitly acceptable to trade away. The host is an RTX 3070 Ti (8 GB VRAM,
+mostly headless but shared with other hosting services) + Ryzen 5600X +
+32 GB RAM, so CPU+GPU hybrid inference is on the table.
+
+The successor family `qwen3.8` ships **only as 27B** (all 12 Ollama tags are
+27b variants; no 4b/8b exists). It is a thinking + vision model; thinking can
+be disabled per request (`think: false` — already sent, see ADR-001
+consequences).
+
+## Decision
+
+Default model: **`qwen3.8:27b-q4_K_M`** (18 GB at Q4_K_M, Apache-2.0),
+inferred in **hybrid mode**: a minority of layers on the 3070 Ti, the
+majority in system RAM.
+
+Config defaults change to match hybrid reality:
+
+| Setting | Old (qwen3.5:4b) | New (27B hybrid) | Why |
+|---|---|---|---|
+| `TL_CONCURRENCY` | 4 | **1** | hybrid decode cannot parallelize; parallel requests would thrash |
+| `TL_MICRO_BATCH` | 8 | **16** | amortize the library prefill over more transactions |
+| `TL_NUM_CTX` | 8192 | **8192** (kept) | worst-case prompt (200-label library + 16 tx with 512-byte fields ≈ 6–9k tokens) would exceed 4096 → Ollama truncates silently; the q8_0 KV-cache saving at 4096 is only ~50–100 MB |
+| `TL_REQUEST_TIMEOUT_SECS` | 30 | **600** | hybrid decode ≈ 3–5 tok/s; 30 s timed out every call → mass fallback |
+
+The `TL_REQUEST_TIMEOUT_SECS` env cap is 3600 s — deliberately above the
+600 s default, so operators on slower hardware (fewer GPU layers → slower
+decode) can raise it instead of failing config validation.
+
+The VRAM advisory check now warns for the default model by design (18 GB
+weights > 80 % of the 8 GB budget); the warning is annotated as expected for
+hybrid mode. `TL_STRICT_VRAM` must stay off with the 27B.
+
+Ollama server-side (documented in README): `OLLAMA_NUM_PARALLEL=1`,
+`OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_FLASH_ATTENTION=1`,
+`OLLAMA_KV_CACHE_TYPE=q8_0`.
+
+## Alternatives considered
+
+| Option | Verdict |
+|---|---|
+| qwen3.8:27b-q8_0 (30 GB) | Fits in hybrid too, but ~½ decode speed for ≈ 0 accuracy gain on a grammar-constrained classification task. Rejected. |
+| qwen3.8:27b-bf16 (56 GB) | Exceeds 8 GB VRAM + 32 GB RAM combined. Rejected. |
+| qwen3.8:27b-mlx / mxfp8 / nvfp4 | MLX tags — macOS only. Rejected. |
+| qwen3.5:4b (ADR-001) | Kept as documented **fast profile**: GPU-only, seconds per batch, measured 1.00 on the golden eval. Select via `TL_MODEL=qwen3.5:4b TL_CONCURRENCY=4 TL_MICRO_BATCH=8 TL_NUM_CTX=8192 TL_REQUEST_TIMEOUT_SECS=30`. |
+| gemma4:12b (ADR-001) | Still rejected: no hybrid advantage over a 27B at Q4, weaker multilingual IF. |
+
+## Consequences
+
+- **Measured (2026-09-02, RTX 5070 Ti 16 GB + 5600X dev box, temperature 0,
+  20-case golden set, one batch, no label library)** — accuracy transfers to
+  the 8 GB target (same model/quant/prompt; the CPU/GPU split does not
+  change output), the wall times do **not**:
+
+  | Model | Accuracy | Stability | Wall time (dev box) |
+  |---|---|---|---|
+  | `qwen3.8:27b-q4_K_M` (hybrid, 49/66 layers GPU) | **0.95** (19/20) | identical across 3 runs | ~33 s per 20-tx eval |
+  | `qwen3.5:4b` (GPU-only, old default) | **0.90** (18/20) | identical across 2 runs | ~4 s per 20-tx eval |
+
+  qwen3.8's single miss (`sepa_reference_in_purpose` → "Streaming" instead
+  of "Shopping/Abo") is a defensible label for an Amazon-Prime SEPA debit;
+  the 4B's two misses ("Transfer" for savings transfer, "Kreditkarte" for a
+  pre-authorization) are semantic errors, not wording variants. Dev-box
+  hybrid throughput: **~10.9 tok/s decode, 57–141 tok/s prefill**
+  (~11.3 GB weights on GPU, ~4.5 GB CPU-mapped).
+- **Latency on the 8 GB target (3070 Ti + 5600X)**: only ~30/66 layers fit
+  on GPU (~7 GB usable); expect ~3–5 tok/s decode. Micro-batches of 8–16
+  transactions take ~1–2 min including the library prefill; a 100-tx batch
+  ≈ 15–25 min. Accepted by the product owner.
+- **Accuracy**: the golden-set live eval with the 4B measured 1.00 under the
+  ADR-006 protocol (with library injected); the 27B holds 0.95 without a
+  library and beats the 4B on the same no-library protocol (0.90). More
+  robust on novel/ambiguous transactions.
+- The 27B is a thinking model: `think: false` remains mandatory (already
+  implemented, `src/llm.rs`).
+- The fast profile remains a one-env-var override away
+  (`tests/golden.rs` live eval honors `TL_MODEL` directly).
